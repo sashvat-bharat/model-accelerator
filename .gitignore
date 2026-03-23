@@ -1,0 +1,11 @@
+prompts.txt
+results.json
+RUN.md
+
+
+.venv
+.env
+models
+models.json
+
+__pycache__
