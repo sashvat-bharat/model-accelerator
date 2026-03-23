@@ -162,8 +162,6 @@ class Engine:
         print(f"         n_threads  : {n_threads}")
         print(f"         n_gpu_layers: {gpu_layers}")
 
-        # Qwen 3.5 Fix: If we detect the user is trying to use the qwen35 architecture
-        # which isn't yet in the stable llama-cpp-python, we force it to look like qwen2.
         self._llm = Llama(
             model_path=model_path,
             n_ctx=n_ctx,
