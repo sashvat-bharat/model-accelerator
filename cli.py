@@ -39,66 +39,85 @@ def cmd_load(args: argparse.Namespace) -> None:
     filename: str = args.file  # optional explicit filename within the repo
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MODELS_DIR / f"{alias}.gguf"
+    
+    # New behavior: destination is a directory named after the alias
+    dest_dir = MODELS_DIR / alias
 
     # ---- HuggingFace repo  (hf://<org/repo> or plain <org/repo>) ----------
     if source.startswith("hf://") or (
         "/" in source and not source.startswith("http")
     ):
         repo_id = source.removeprefix("hf://")
-        _download_hf(repo_id, dest, filename)
+        _download_hf(repo_id, dest_dir, filename)
+        register_model(alias, str(dest_dir), source)
 
     # ---- Direct HTTPS URL -------------------------------------------------
     elif source.startswith("http://") or source.startswith("https://"):
-        _download_url(source, dest)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / f"{alias}.gguf"
+        _download_url(source, dest_file)
+        register_model(alias, str(dest_dir), source)
 
     # ---- Local file path --------------------------------------------------
     elif Path(source).exists():
         import shutil
-        print(f"[load] Copying local file → {dest}")
-        shutil.copy2(source, dest)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if Path(source).is_dir():
+            print(f"[load] Copying local directory → {dest_dir}")
+            shutil.copytree(source, dest_dir, dirs_exist_ok=True)
+        else:
+            print(f"[load] Copying local file → {dest_dir / Path(source).name}")
+            shutil.copy2(source, dest_dir / Path(source).name)
+        register_model(alias, str(dest_dir), source)
 
     else:
         sys.exit(f"[error] Cannot resolve source: '{source}'")
 
-    register_model(alias, str(dest), source)
-    print(f"[load] Done. Use:  python cli.py run {alias} --prompt \"Hello\"")
+    print(f"[load] Done. Use:  python cli.py run {alias} --prompt \"Hello\" --chat")
 
 
-def _download_hf(repo_id: str, dest: Path, filename: str | None) -> None:
+def _download_hf(repo_id: str, dest_dir: Path, filename: str | None) -> Path:
     try:
-        from huggingface_hub import hf_hub_download, list_repo_files
+        from huggingface_hub import snapshot_download, list_repo_files
     except ImportError:
         sys.exit("[error] huggingface_hub not installed. Run: pip install huggingface_hub")
 
-    # Auto-pick the GGUF file if no explicit filename given
+    # 1. Identify all GGUF files in the repo
+    all_files = list(list_repo_files(repo_id))
+    gguf_files = [f for f in all_files if f.endswith(".gguf")]
+    if not gguf_files:
+        sys.exit(f"[error] No .gguf files found in {repo_id}")
+
+    # 2. Select the specific GGUF file to download
     if not filename:
-        all_files = list(list_repo_files(repo_id))
-        gguf_files = [f for f in all_files if f.endswith(".gguf")]
-        if not gguf_files:
-            sys.exit(f"[error] No .gguf files found in {repo_id}. Files:\n" + "\n".join(all_files))
-        # Prefer Q4_K_M → Q4_K_S → first available
+        # Preference: Q4_K_M -> Q4_K_S -> Q5_K_M -> Q8_0 -> first available
         preferred = ["Q4_K_M", "Q4_K_S", "Q5_K_M", "Q8_0"]
-        filename = gguf_files[0]  # fallback
+        filename = gguf_files[0]
         for tag in preferred:
             match = [f for f in gguf_files if tag in f]
             if match:
                 filename = match[0]
                 break
-        print(f"[load] Auto-selected: {filename}  (from {repo_id})")
+        print(f"[load] Auto-selected GGUF: {filename}")
 
-    print(f"[load] Downloading {repo_id}/{filename} …")
-    tmp_path = hf_hub_download(
+    # 3. Define allow/ignore patterns
+    # We want: 
+    #   - The selected GGUF file
+    #   - All config/tokenizer files (.json, .model, .txt)
+    #   - Ignore all OTHER .gguf files
+    other_ggufs = [f for f in gguf_files if f != filename]
+    
+    print(f"[load] Downloading {repo_id} (GGUF: {filename}) to {dest_dir} …")
+    
+    final_path = snapshot_download(
         repo_id=repo_id,
-        filename=filename,
-        local_dir=str(dest.parent),
+        local_dir=str(dest_dir),
+        allow_patterns=[filename, "*.json", "*.model", "*.txt", "*.py", "template", "params"],
+        ignore_patterns=other_ggufs,
         local_dir_use_symlinks=False,
     )
-    # hf_hub_download puts it at <local_dir>/<filename>; rename to <alias>.gguf
-    dl = Path(tmp_path)
-    if dl != dest:
-        dl.rename(dest)
-    print(f"[load] Saved → {dest}  ({dest.stat().st_size / 1e9:.2f} GB)")
+    
+    return Path(final_path) / filename
 
 
 def _download_url(url: str, dest: Path) -> None:
@@ -143,7 +162,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     
     if stream:
         for tok in engine.generate(prompt, max_tokens=args.max_tokens,
-                                   temperature=args.temp, stream=True):
+                                   temperature=args.temp, stream=True,
+                                   chat_format=args.chat):
             print(tok, end="", flush=True)
             tokens += 1
             
@@ -153,7 +173,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"\033[90m[{tokens} tokens | {tps:.1f} tok/s | {elapsed:.2f}s]\033[0m")
     else:
         output = engine.generate(prompt, max_tokens=args.max_tokens,
-                                 temperature=args.temp, stream=False)
+                                 temperature=args.temp, stream=False,
+                                 chat_format=args.chat)
         elapsed = time.perf_counter() - t0
         print(output)
         print("\n" + "─" * 50)
@@ -190,6 +211,8 @@ def cmd_batch(args: argparse.Namespace) -> None:
         prompts,
         max_tokens=args.max_tokens,
         temperature=args.temp,
+        parallel=args.parallel,
+        chat_format=args.chat,
     )
 
     # Optionally write results to JSON
@@ -229,7 +252,6 @@ def cmd_chat(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Subcommand: list
 # ---------------------------------------------------------------------------
-
 def cmd_list(_args: argparse.Namespace) -> None:
     from engine import list_models
 
@@ -242,9 +264,17 @@ def cmd_list(_args: argparse.Namespace) -> None:
     print("-" * 70)
     for alias, meta in reg.items():
         p = Path(meta["path"])
-        size = f"{p.stat().st_size / 1e9:.2f}G" if p.exists() else "MISSING"
+        if not p.exists():
+            size = "MISSING"
+        elif p.is_dir():
+            # Sum up all files in the directory
+            total_bytes = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+            size = f"{total_bytes / 1e9:.2f}G"
+        else:
+            size = f"{p.stat().st_size / 1e9:.2f}G"
         print(f"{alias:<20}  {size:>8}  {meta['source']}")
     print()
+
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +353,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
 
 def _add_perf_args(p: argparse.ArgumentParser) -> None:
     """Common performance-tuning flags shared by run/batch/chat/bench."""
-    import multiprocessing, os
+    import multiprocessing
+    import os
     p.add_argument("--gpu-layers", type=int, default=None,
                    help="GPU layers to offload (0=CPU, None=auto-detect)")
     p.add_argument("--n-ctx", type=int,
@@ -340,6 +371,8 @@ def _add_perf_args(p: argparse.ArgumentParser) -> None:
                    help="Max tokens to generate (default: 512)")
     p.add_argument("--temp", type=float, default=0.7,
                    help="Sampling temperature (default: 0.7)")
+    p.add_argument("--chat", action="store_true",
+                   help="Apply the model's internal chat template to the prompt")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -376,6 +409,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Text file with one prompt per line")
     p_batch.add_argument("--output", default=None,
                          help="Write JSON results to this file")
+    p_batch.add_argument("--parallel", type=int, default=0,
+                         help="Max prompts per parallel sub-batch (0=auto, fits context window)")
     _add_perf_args(p_batch)
     p_batch.set_defaults(func=cmd_batch)
 

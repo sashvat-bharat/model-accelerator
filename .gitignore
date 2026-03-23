@@ -1,11 +1,30 @@
-prompts.txt
+# User files
 results.json
 RUN.md
 
-
+# Python / Environment
 .venv
 .env
-models
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Application Data (Machine-specific)
+models/
 models.json
 
-__pycache__
+# IDEs / Editors / OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing / Quality
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/

@@ -1,8 +1,0 @@
-# Core inference bindings
-llama-cpp-python
-
-# HuggingFace model hub (download + repo listing)
-huggingface_hub
-
-# Optional — only needed if you want GPU auto-detection via torch
-# torch
