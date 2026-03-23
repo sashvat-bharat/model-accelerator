@@ -1,9 +1,6 @@
 # 🚀 model-accelerator
 
-> **A minimal, high-performance LLM inference engine — powered by llama.cpp and GGUF**
-
-No cloud APIs, no heavy frameworks, no Docker fuss — just download a model and start chatting, right on your own hardware. The entire core is intentionally tiny: **2 Python files, 1 shell script, ~850 lines total.**
-
+> **The fastest, most efficient library for running AI models with maximum throughput at any scale.**
 ---
 
 ## ⚡ Quick Start
