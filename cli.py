@@ -1,5 +1,5 @@
 """
-cli.py — Command-line interface for the llama.cpp inference engine.
+cli.py — Command-line interface for the GGUF inference engine.
 
 Usage:
   python cli.py load <hf_repo_or_url> --alias <name> [--file <filename>]
@@ -141,12 +141,18 @@ def _download_url(url: str, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_run(args: argparse.Namespace) -> None:
-    from engine import Engine
+    from engine import Engine, get_model_config
 
+    # Load persistent config
+    config_data = get_model_config(args.alias)
+    
+    # Priority: CLI flag > Persisted Config > Env/Default
+    n_ctx = args.n_ctx or config_data.get("configured_context_length")
+    
     engine = Engine(
         alias=args.alias,
         n_gpu_layers=args.gpu_layers,
-        n_ctx=args.n_ctx,
+        n_ctx=n_ctx,
         n_batch=args.n_batch,
         n_threads=args.n_threads,
     )
@@ -157,12 +163,32 @@ def cmd_run(args: argparse.Namespace) -> None:
     # Always stream for a better UX unless explicitly disabled
     stream = not args.no_stream 
     
+    # Resolve and display generation parameters
+    # Fallback logic for display only (engine does the actual enforcement)
+    disp_max = args.max_tokens or config_data.get("max_output_tokens") or "auto"
+    disp_temp = args.temp
+    if disp_temp is None:
+        disp_temp = config_data.get("temperature", 0.7)
+    
+    print(f"\033[1;36mGENERATION\033[0m")
+    print(f"{'  Prompt':<12} : \"{prompt[:60]}{'...' if len(prompt)>60 else ''}\"")
+    print(f"{'  Temp':<12} : {disp_temp:.2f}")
+    if disp_max == "auto":
+        # Guess the auto value for display purposes similar to Engine
+        inp_len = len(prompt.split()) * 1.3 # Very rough guess
+        resolved_max = max(128, int(engine._n_ctx - inp_len - 20))
+        print(f"{'  Max Tokens':<12} : auto ({resolved_max} available)")
+    else:
+        print(f"{'  Max Tokens':<12} : {disp_max}")
+    print(f"{'  Mode':<12} : {'Streaming' if stream else 'Static'} ({'Chat' if args.chat else 'Completion'})")
+
     print("\n" + "─" * 50)
     tokens = 0
-    
+    max_tokens = args.max_tokens
+
     if stream:
-        for tok in engine.generate(prompt, max_tokens=args.max_tokens,
-                                   temperature=args.temp, stream=True,
+        for tok in engine.generate(prompt, max_tokens=max_tokens,
+                                   temperature=disp_temp, stream=True,
                                    chat_format=args.chat):
             print(tok, end="", flush=True)
             tokens += 1
@@ -199,17 +225,34 @@ def cmd_batch(args: argparse.Namespace) -> None:
 
     print(f"[batch] {len(prompts)} prompts loaded from {args.file}")
 
+    from engine import Engine, get_model_config
+
+    # Load config
+    config_data = get_model_config(args.alias)
+    n_ctx = args.n_ctx or config_data.get("configured_context_length")
+
+    # Resolve and display generation parameters
+    disp_max = args.max_tokens or config_data.get("max_output_tokens") or "auto"
+    print(f"\033[1;36mGENERATION (Batch)\033[0m")
+    print(f"{'  Source':<12} : {args.file} ({len(prompts)} prompts)")
+    print(f"{'  Parallel':<12} : {args.parallel if args.parallel > 0 else 'auto'}")
+    print(f"{'  Max Tokens':<12} : {disp_max}")
+    print("\n" + "─" * 50)
+
     engine = Engine(
         alias=args.alias,
         n_gpu_layers=args.gpu_layers,
-        n_ctx=args.n_ctx,
+        n_ctx=n_ctx,
         n_batch=args.n_batch,
         n_threads=args.n_threads,
     )
 
+    # Let the engine resolve max_tokens from its persistent config/auto-logic
+    max_tokens = args.max_tokens
+
     results = engine.generate_batch(
         prompts,
-        max_tokens=args.max_tokens,
+        max_tokens=max_tokens,
         temperature=args.temp,
         parallel=args.parallel,
         chat_format=args.chat,
@@ -233,19 +276,27 @@ def cmd_batch(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_chat(args: argparse.Namespace) -> None:
-    from engine import Engine
+    from engine import Engine, get_model_config
+
+    # Load config
+    config_data = get_model_config(args.alias)
+    n_ctx = args.n_ctx or config_data.get("configured_context_length")
 
     engine = Engine(
         alias=args.alias,
         n_gpu_layers=args.gpu_layers,
-        n_ctx=args.n_ctx,
+        n_ctx=n_ctx,
         n_batch=args.n_batch,
         n_threads=args.n_threads,
     )
+    temp = args.temp
+    if temp is None:
+        temp = config_data.get("temperature", 0.7)
+
     engine.chat(
         system_prompt=args.system,
         max_tokens=args.max_tokens,
-        temperature=args.temp,
+        temperature=temp,
     )
 
 
@@ -278,26 +329,89 @@ def cmd_list(_args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand: info
+# Subcommand: config
 # ---------------------------------------------------------------------------
 
-def cmd_info(args: argparse.Namespace) -> None:
-    from engine import list_models
-
-    reg = list_models()
+def cmd_config(args: argparse.Namespace) -> None:
+    from engine import get_model_capabilities, get_model_config, set_model_config
+    
     alias = args.alias
-    if alias not in reg:
-        sys.exit(f"[error] Unknown alias '{alias}'")
+    caps = get_model_capabilities(alias)
+    if not caps.get("exists"):
+        sys.exit(f"[error] Unknown or missing model alias '{alias}'")
+        
+    # 1. Update config if flags provided
+    new_config = {}
+    if args.n_ctx:
+        new_config["configured_context_length"] = args.n_ctx
+    if args.max_input:
+        new_config["max_input_tokens"] = "auto" if args.max_input == "auto" else int(args.max_input)
+    if args.max_output:
+        new_config["max_output_tokens"] = "auto" if args.max_output == "auto" else int(args.max_output)
+    if args.temp is not None:
+        new_config["temperature"] = args.temp
+    if args.top_p is not None:
+        new_config["top_p"] = args.top_p
+    if args.top_k is not None:
+        new_config["top_k"] = args.top_k
+        
+    if new_config:
+        # Load current to validate
+        current = get_model_config(alias)
+        current.update(new_config)
+        
+        # Validation Logic
+        ctx = current.get("configured_context_length") or caps["total_context_length"]
+        inp = current.get("max_input_tokens")
+        out = current.get("max_output_tokens")
+        
+        # Resolve 'auto' for validation
+        v_inp = 0 if inp == "auto" else (inp or 0)
+        v_out = 0 if out == "auto" else (out or 0)
+        
+        if v_inp + v_out > ctx:
+            sys.exit(f"[error] Invalid Config: max_input ({v_inp}) + max_output ({v_out}) exceeds n_ctx ({ctx})")
+            
+        set_model_config(alias, current)
+        print(f"[config] Updated settings for '{alias}'.")
 
-    meta = reg[alias]
-    p = Path(meta["path"])
-    print(f"\nAlias  : {alias}")
-    print(f"Source : {meta['source']}")
-    print(f"Path   : {meta['path']}")
-    print(f"Exists : {p.exists()}")
-    if p.exists():
-        print(f"Size   : {p.stat().st_size / 1e9:.3f} GB")
-    print()
+    # 2. Display Result
+    config = get_model_config(alias)
+    
+    # Calculate Auto Values for Display
+    disp_ctx = config.get("configured_context_length") or caps["total_context_length"]
+    disp_inp = config.get("max_input_tokens")
+    disp_out = config.get("max_output_tokens")
+    
+    if disp_inp == "auto" and disp_out == "auto":
+        v_inp = disp_ctx // 2
+        v_out = disp_ctx - v_inp
+    elif disp_inp == "auto":
+        v_out = int(disp_out or 512)
+        v_inp = disp_ctx - v_out
+    elif disp_out == "auto":
+        v_inp = int(disp_inp or 512)
+        v_out = disp_ctx - v_inp
+    else:
+        v_inp, v_out = disp_inp, disp_out
+
+    print(f"\n\033[1mMODEL CAPABILITIES (read-only)\033[0m")
+    print(f"{'  Alias':<30} : {caps['alias']}")
+    print(f"{'  Path':<30} : {caps['path']}")
+    print(f"{'  Size':<30} : {caps['size']}")
+    print(f"{'  Total Context Limit':<30} : {caps['total_context_length']} tokens")
+
+    print(f"\n\033[1mUSER CONFIGURATION (editable)\033[0m")
+    print(f"{'  Configured Context (n-ctx)':<30} : {disp_ctx} tokens")
+    print(f"{'  Input Token Limit':<30} : {disp_inp} {'(' + str(v_inp) + ' resolved)' if disp_inp == 'auto' else ''}")
+    print(f"{'  Output Token Limit':<30} : {disp_out} {'(' + str(v_out) + ' resolved)' if disp_out == 'auto' else ''}")
+    
+    print(f"\n\033[1mSAMPLING PARAMETERS (editable)\033[0m")
+    print(f"{'  Temperature':<30} : {config.get('temperature', 0.7)}")
+    print(f"{'  Top-P':<30} : {config.get('top_p', 0.9)}")
+    print(f"{'  Top-K':<30} : {config.get('top_k', 40)}")
+
+    print(f"\n\033[90mTip: Use --n-ctx, --max-output, --temp, etc., to change these.\033[0m\n")
 
 
 # ---------------------------------------------------------------------------
@@ -355,22 +469,18 @@ def _add_perf_args(p: argparse.ArgumentParser) -> None:
     """Common performance-tuning flags shared by run/batch/chat/bench."""
     import multiprocessing
     import os
-    p.add_argument("--gpu-layers", type=int, default=None,
-                   help="GPU layers to offload (0=CPU, None=auto-detect)")
-    p.add_argument("--n-ctx", type=int,
-                   default=int(os.environ.get("LLM_N_CTX", "4096")),
-                   help="Context window size (default: 4096)")
-    p.add_argument("--n-batch", type=int,
-                   default=int(os.environ.get("LLM_N_BATCH", "512")),
-                   help="Token batch size — larger = more throughput (default: 512)")
-    p.add_argument("--n-threads", type=int,
-                   default=int(os.environ.get("LLM_N_THREADS",
-                               str(min(multiprocessing.cpu_count(), 8)))),
+    p.add_argument("--gpu-layers", default=None,
+                   help="GPU layers to offload (0=CPU, -1=all, max=auto-detect best fit)")
+    p.add_argument("--n-ctx", type=int, default=None,
+                   help="Context window size (persisted default available via 'config')")
+    p.add_argument("--n-batch", type=int, default=None,
+                   help="Token batch size (default: 512)")
+    p.add_argument("--n-threads", type=int, default=None,
                    help="CPU threads (default: min(cpus, 8))")
-    p.add_argument("--max-tokens", type=int, default=512,
-                   help="Max tokens to generate (default: 512)")
-    p.add_argument("--temp", type=float, default=0.7,
-                   help="Sampling temperature (default: 0.7)")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="Max tokens to generate (persisted default available via 'config')")
+    p.add_argument("--temp", type=float, default=None,
+                   help="Sampling temperature (default: 0.7 or persisted value)")
     p.add_argument("--chat", action="store_true",
                    help="Apply the model's internal chat template to the prompt")
 
@@ -378,7 +488,7 @@ def _add_perf_args(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="engine",
-        description="High-performance llama.cpp inference engine (GGUF)",
+        description="High-performance GGUF inference engine",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -426,10 +536,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="Show all registered models")
     p_list.set_defaults(func=cmd_list)
 
-    # ---- info ----
-    p_info = sub.add_parser("info", help="Show details for one alias")
-    p_info.add_argument("alias", help="Model alias")
-    p_info.set_defaults(func=cmd_info)
+    # ---- config ----
+    p_config = sub.add_parser("config", help="View or modify model configuration")
+    p_config.add_argument("alias", help="Model alias")
+    p_config.add_argument("--n-ctx", type=int, help="Adjust total context window")
+    p_config.add_argument("--max-input", help="Set max input tokens (or 'auto')")
+    p_config.add_argument("--max-output", help="Set max output tokens (or 'auto')")
+    p_config.add_argument("--temp", type=float, help="Set default generation temperature")
+    p_config.add_argument("--top-p", type=float, help="Set default Top-P sampling")
+    p_config.add_argument("--top-k", type=int, help="Set default Top-K sampling")
+    p_config.set_defaults(func=cmd_config)
 
     # ---- bench ----
     p_bench = sub.add_parser("bench", help="Throughput benchmark")
@@ -451,7 +567,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\n[engine] Process interrupted.")
+    except Exception as e:
+        print(f"\n[error] Engine failed: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """
-engine.py — Core inference engine for llama.cpp (GGUF) models.
+engine.py — Core inference engine for GGUF models.
 
 Handles:
   - Model registry (models.json)
@@ -19,6 +19,30 @@ import time
 import multiprocessing
 from pathlib import Path
 from typing import Iterator
+from contextlib import contextmanager
+
+import warnings
+import re
+try:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        import pynvml
+    _HAS_PYNVML = True
+except ImportError:
+    _HAS_PYNVML = False
+
+@contextmanager
+def suppress_c_stderr():
+    fd = sys.stderr.fileno()
+    original_stderr = os.dup(fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, fd)
+    try:
+        yield
+    finally:
+        os.dup2(original_stderr, fd)
+        os.close(original_stderr)
+        os.close(devnull)
 
 # ---------------------------------------------------------------------------
 # Registry helpers
@@ -70,20 +94,168 @@ def list_models() -> dict:
     return _load_registry()
 
 
+def get_model_capabilities(alias: str) -> dict:
+    """Read GGUF metadata to determine model limits without loading weights."""
+    from llama_cpp import Llama
+    
+    path = resolve_model(alias)
+    p = Path(path)
+    meta = _load_registry().get(alias, {})
+    
+    # Defaults
+    caps = {
+        "alias": alias,
+        "source": meta.get("source", "local"),
+        "path": str(p),
+        "exists": p.exists(),
+        "size": f"{p.stat().st_size / 1e9:.2f} GB" if p.exists() else "0 GB",
+        "total_context_length": 4096, # fallback
+    }
+    
+    if p.exists():
+        try:
+            # Load with vocab_only=True is extremely fast and light
+            with suppress_c_stderr():
+                temp_llm = Llama(model_path=path, vocab_only=True, verbose=False)
+                
+                # Dynamic key search: find anything ending in '.context_length' 
+                # (e.g. qwen2.context_length, llama.context_length, gpt-oss.context_length)
+                found_ctx = None
+                for k, v in temp_llm.metadata.items():
+                    if k.endswith(".context_length") and not k.endswith(".original_context_length"):
+                        try:
+                            found_ctx = int(v)
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                
+                if found_ctx:
+                    caps["total_context_length"] = found_ctx
+                
+                del temp_llm
+        except Exception:
+            pass
+            
+    return caps
+
+
+def get_model_config(alias: str) -> dict:
+    """Load user-defined configuration from the model's directory."""
+    reg = _load_registry()
+    if alias not in reg:
+        return {}
+        
+    model_dir = Path(reg[alias]["path"])
+    params_path = model_dir / "params.json"
+    
+    config = {
+        "configured_context_length": None,
+        "max_input_tokens": "auto",
+        "max_output_tokens": "auto",
+    }
+    
+    if params_path.exists():
+        try:
+            with params_path.open() as f:
+                data = json.load(f)
+                config.update({k: data[k] for k in config if k in data})
+        except Exception:
+            pass
+            
+    return config
+
+
+def set_model_config(alias: str, config: dict) -> None:
+    """Save user-defined configuration to the model's directory."""
+    reg = _load_registry()
+    if alias not in reg:
+        return
+        
+    model_dir = Path(reg[alias]["path"])
+    model_dir.mkdir(parents=True, exist_ok=True)
+    params_path = model_dir / "params.json"
+    
+    # Load existing to merge
+    existing = {}
+    if params_path.exists():
+        try:
+            with params_path.open() as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+            
+    existing.update(config)
+    params_path.write_text(json.dumps(existing, indent=2))
+
+
 # ---------------------------------------------------------------------------
 # GPU detection
 # ---------------------------------------------------------------------------
 
-def _detect_gpu_layers() -> int:
+def _detect_max_gpu_layers(model_path: str, alias: str) -> int:
     """
-    Returns -1 to strictly enforce maximum GPU offloading for all layers,
-    as requested by the user.
+    Attempts to calculate the optimal number of layers to offload to the GPU
+    based on free VRAM and model file size.
+    """
+    if not _HAS_PYNVML:
+        return -1 # Default to 'all' if we can't detect VRAM
+
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        free_vram_mb = info.free / 1024 / 1024
+        pynvml.nvmlShutdown()
+
+        # Reserve ~1.5GB for KV cache, UI, and system spikes
+        available_mb = free_vram_mb - 1536
+        if available_mb <= 0:
+            print(f"[engine] Smart-Max: Low VRAM ({free_vram_mb:.0f}MB). Keeping on CPU.")
+            return 0
+
+        # Estimate model layer count and memory per layer
+        model_size_mb = Path(model_path).stat().st_size / 1024 / 1024
+        
+        # Standard GGUF layer counts for common architectures
+        if model_size_mb > 15000:   # 30B+
+            total_layers = 80
+        elif model_size_mb > 10000: # 20B
+            total_layers = 62
+        elif model_size_mb > 5000:  # 7B-13B
+            total_layers = 35
+        else:                       # Small 1B-3B models
+            total_layers = 26
+
+        # Q4_K_M usually adds ~15% overhead for buffers beyond weights
+        eff_model_size_mb = model_size_mb * 1.15
+        mb_per_layer = eff_model_size_mb / total_layers
+        
+        max_layers = int(available_mb / mb_per_layer)
+        max_layers = max(0, min(max_layers, total_layers))
+        
+        if max_layers >= total_layers:
+            print(f"[engine] Smart-Max: Fitting all {total_layers} layers in VRAM.")
+            return -1
+        
+        print(f"[engine] Smart-Max: Detected {free_vram_mb:.0f}MB free. Offloading {max_layers}/{total_layers} layers.")
+        return max_layers
+
+    except Exception:
+        return -1
+
+
+def _detect_gpu_layers(model_path: str, alias: str) -> int:
+    """
+    Returns the GPU layer count. -1 means all.
     """
     env = os.environ.get("LLM_GPU_LAYERS")
     if env is not None:
+        if env.lower() == "max":
+            return _detect_max_gpu_layers(model_path, alias)
         return int(env)
 
-    return -1
+    # Default to Smart Max for best UX
+    return _detect_max_gpu_layers(model_path, alias)
 
 
 # ---------------------------------------------------------------------------
@@ -98,30 +270,59 @@ _DEFAULT_N_THREADS = int(os.environ.get("LLM_N_THREADS", str(min(multiprocessing
 
 class Engine:
     """
-    Thin wrapper around llama-cpp-python's Llama class.
+    Thin wrapper around the GGUF runtime.
 
     Design decisions for throughput:
       - Single model instance; never reloaded between calls.
       - n_batch=512 (default) — token-batch size fed to the model at once.
         Increasing this trades memory for throughput on long prompts.
-      - n_threads=min(cpus, 8) — beyond ~8 threads, llama.cpp sees diminishing returns.
+      - n_threads=min(cpus, 8) — beyond ~8 threads, the engine sees diminishing returns.
       - n_gpu_layers auto-detected — partial offloading beats full CPU for most 6 GB cards.
-      - verbose=False — suppresses llama.cpp progress spam.
+      - verbose=False — suppresses progress spam.
     """
 
     def __init__(
         self,
         alias: str,
-        n_ctx: int = _DEFAULT_N_CTX,
+        n_ctx: int | None = None,
         n_batch: int = _DEFAULT_N_BATCH,
         n_threads: int = _DEFAULT_N_THREADS,
-        n_gpu_layers: int | None = None,
+        n_gpu_layers: int | str | None = None,
     ) -> None:
         from llama_cpp import Llama, llama_chat_format  # lazy import — lets the CLI load fast
 
         model_path = str(Path(resolve_model(alias)).resolve())
         model_dir = Path(model_path).parent
-        gpu_layers = n_gpu_layers if n_gpu_layers is not None else _detect_gpu_layers()
+        model_size_mb = Path(model_path).stat().st_size / 1024 / 1024
+
+        # Load persistent config
+        config = get_model_config(alias)
+        caps = get_model_capabilities(alias)
+        
+        # Priority: constructor arg > persisted config > env var > default
+        if n_ctx is None:
+            n_ctx = config.get("configured_context_length") or _DEFAULT_N_CTX
+        # Safety: clamp to model's total capacity
+        if caps.get("total_context_length"):
+            n_ctx = min(n_ctx, caps["total_context_length"])
+
+        # Default fallback for None (from CLI)
+        if n_batch is None:
+            n_batch = _DEFAULT_N_BATCH
+        if n_threads is None:
+            n_threads = _DEFAULT_N_THREADS
+
+        self._config = config
+        self._caps = caps
+        self._alias = alias
+        self._n_ctx = n_ctx
+
+        if n_gpu_layers == "max":
+             gpu_layers = _detect_max_gpu_layers(model_path, alias)
+        elif n_gpu_layers is not None:
+             gpu_layers = int(n_gpu_layers)
+        else:
+             gpu_layers = _detect_gpu_layers(model_path, alias)
 
         print(f"[engine] Loading '{alias}' …")
         print(f"         path       : {model_path}")
@@ -164,15 +365,46 @@ class Engine:
                     try:
                         t_str = rp.read_text().strip()
                         
-                        # Robust check: if it looks like a Go template (Ollama/Dot-syntax), 
-                        # Jinja2 will fail. Convert or fallback.
-                        if ".Role" in t_str and ".Content" in t_str:
-                            print(f"[engine] Raw template in '{rc}' is Go-style. Converting to Jinja2...")
-                            # Simple conversion for standard ChatML-like Go templates
-                            if "<|im_start|>" in t_str:
-                                t_str = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+                        # --- Official Template Translator ---
+                        # Perform a strict 1:1 conversion from Go-style to Jinja2
+                        # without adding any extra 'Final Channel' logic.
                         
-                        print(f"[engine] Using raw chat template from {rc}")
+                        t_str = t_str.replace(".Role", "message['role']")
+                        t_str = t_str.replace(".Content", "message['content']")
+                        t_str = t_str.replace(".Thinking", "message.get('thinking','')")
+                        t_str = t_str.replace("range .Messages", "for message in messages")
+                        t_str = t_str.replace("range .Tools", "for tool in tools")
+                        t_str = t_str.replace("{{ currentDate }}", "{{ strftime_now('%Y-%m-%d') }}")
+                        t_str = t_str.replace("{{ .System }}", "{{ system_prompt }}")
+                        t_str = t_str.replace("if .Tools", "if tools")
+                        t_str = t_str.replace("else if", "elif")
+
+                        # Extract termination tags for stopping
+                        all_tags = re.findall(r"<\|[a-z0-9_.\-:]+\|>", t_str)
+                        all_tags += re.findall(r"\[[A-Z0-9_.\-:]+\]", t_str)
+                        
+                        # We only want tags that mean "stop" or "yield"
+                        stop_markers = ["end", "stop", "return", "call", "im_end"]
+                        # Filter out structural tags that must NOT stop the model
+                        exclude_markers = ["start", "message", "channel", "assistant", "system", "user", "<|end|>"]
+                        
+                        self._custom_stop = []
+                        for tag in all_tags:
+                            tag_low = tag.lower()
+                            if any(sm in tag_low for sm in stop_markers):
+                                if not any(em in tag_low for em in exclude_markers):
+                                     self._custom_stop.append(tag)
+                        
+                        self._custom_stop = list(set(self._custom_stop + ["</s>", "<|im_end|>", "<|eot_id|>"]))
+
+                        # Minimal Jinja wrapper if missing
+                        if "{% for" not in t_str:
+                             t_str = "{% for message in messages %}{{ '<|start|>' + message['role'] + '<|message|>\\n' + message['content'] + '<|end|>\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|start|>assistant' }}{% endif %}"
+                        
+                        # Debug info
+                        if os.getenv("DEBUG"):
+                            print(f"[debug] Stop tokens: {self._custom_stop}")
+                        
                         # Some versions of llama-cpp-python assert that common tokens exist in the dict
                         dummy_config = {
                             "chat_template": t_str,
@@ -181,8 +413,8 @@ class Engine:
                         }
                         chat_handler = llama_chat_format.hf_tokenizer_config_to_chat_completion_handler(dummy_config)
                         break
-                    except Exception as e:
-                        print(f"[warn] Error reading {rc}: {repr(e)}")
+                    except Exception:
+                        pass
 
         # 3. Try Raw Params (non-standard 'params' file)
         pp = model_dir / "params"
@@ -197,17 +429,63 @@ class Engine:
             except Exception:
                 pass
 
-        self._llm = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_batch=n_batch,
-            n_threads=n_threads,
-            n_gpu_layers=gpu_layers,
-            verbose=False,
-            logits_all=False,
-            use_mmap=True,
-            chat_handler=chat_handler,
-        )
+        import llama_cpp._internals
+        original_del = llama_cpp._internals.LlamaModel.__del__
+        def safe_del(obj):
+            try:
+                original_del(obj)
+            except Exception:
+                pass
+        llama_cpp._internals.LlamaModel.__del__ = safe_del
+
+        # --- Automatic Multi-Layer Loading ---
+        self._llm = None
+        attempts = 0
+        max_attempts = 20
+        
+        while self._llm is None and attempts < max_attempts:
+            try:
+                with suppress_c_stderr():
+                    self._llm = Llama(
+                        model_path=model_path,
+                        n_ctx=n_ctx,
+                        n_batch=n_batch,
+                        n_threads=n_threads,
+                        n_gpu_layers=gpu_layers,
+                        verbose=False,
+                        logits_all=False,
+                        use_mmap=True,
+                        flash_attn=True,
+                        chat_handler=chat_handler,
+                    )
+            except (ValueError, RuntimeError) as e:
+                attempts += 1
+                if gpu_layers <= 0:
+                    raise RuntimeError(f"Engine failed to load even on CPU: {e}")
+                
+                # Backtrack by 1 layer at a time to maximize GPU utilization
+                step = 1
+                old_layers = gpu_layers if gpu_layers != -1 else "all"
+                
+                if gpu_layers == -1:
+                    # If we tried 'all', start from a reasonable max for backtracking
+                    if model_size_mb > 15000:   # 30B+
+                        gpu_layers = 80
+                    elif model_size_mb > 10000: # 20B
+                        gpu_layers = 62
+                    elif model_size_mb > 5000:  # 7B-13B
+                        gpu_layers = 35
+                    else:                       # Small 1B-3B models
+                        gpu_layers = 26
+                
+                gpu_layers = max(0, gpu_layers - step)
+                
+                print(f"[warn] VRAM limit reached at {old_layers} layers. Retrying with {gpu_layers}...")
+                time.sleep(0.3) # Let VRAM settle
+
+        if not self._llm:
+            raise RuntimeError(f"Failed to load engine for '{alias}' after {max_attempts} attempts. Try lowering --gpu-layers manually.")
+            
         self._alias = alias
         
         # Detect chat template
@@ -259,62 +537,72 @@ class Engine:
     def generate(
         self,
         prompt: str,
-        max_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
         stream: bool = False,
         chat_format: bool = False,
     ) -> str | Iterator[str]:
         """
         Generate text for a single prompt.
-
-        Args:
-            prompt:     Input text.
-            max_tokens: Maximum tokens to generate.
-            temperature / top_p: Sampling parameters.
-            stream:     If True, yields tokens as a generator.
-            chat_format: If True, wraps the prompt in the model's chat template.
-
-        Returns:
-            Complete string (stream=False) or token iterator (stream=True).
         """
+        # Resolve sampling from persistent config
+        if temperature is None:
+            temperature = float(self._config.get("temperature", 0.7))
+        if top_p is None:
+            top_p = float(self._config.get("top_p", 0.9))
+        if top_k is None:
+            top_k = int(self._config.get("top_k", 40))
+
+        # Fallback to persistent config
+        if max_tokens is None:
+            saved = self._config.get("max_output_tokens")
+            if saved == "auto":
+                # Maximize based on remaining budget
+                input_toks = self._llm.tokenize(prompt.encode("utf-8"))
+                # Use entire remaining window minus a 10-token safety buffer
+                max_tokens = max(128, self._n_ctx - len(input_toks) - 10)
+            else:
+                # If neither CLI nor persistent config is set, default to large response (2048) or full context
+                if saved is None:
+                     input_toks = self._llm.tokenize(prompt.encode("utf-8"))
+                     max_tokens = max(128, self._n_ctx - len(input_toks) - 10)
+                else:
+                     max_tokens = int(saved)
+
         if chat_format:
-            # Wrap as a simple user message
+            # For GPT-OSS and better control, we use raw generation with manual template
             messages = [{"role": "user", "content": prompt}]
+            actual_prompt = self.apply_chat_template(messages, add_generation_prompt=True)
+            stop = list(set(self._custom_stop))
             
-            # For chat-formatted prompts, we also need to handle stop tokens
-            # We can use create_chat_completion which handles this automatically
-            stop = self._custom_stop
-            if stream:
-                def _gen():
-                    for chunk in self._llm.create_chat_completion(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        stream=True,
-                        stop=stop,
-                    ):
-                        delta = chunk["choices"][0]["delta"]
-                        if "content" in delta:
-                            yield delta["content"]
-                return _gen()
-            
-            result = self._llm.create_chat_completion(
-                messages=messages,
+            kwargs = dict(
+                prompt=actual_prompt,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                stream=False,
+                top_k=top_k,
+                echo=False,
+                stream=stream,
                 stop=stop,
             )
-            return result["choices"][0]["message"]["content"]
+
+            if stream:
+                def _gen():
+                    for chunk in self._llm(**kwargs):
+                        yield chunk["choices"][0]["text"]
+                return _gen()
+            
+            result = self._llm(**kwargs)
+            return result["choices"][0]["text"]
 
         kwargs = dict(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             echo=False,
             stream=stream,
         )
@@ -335,26 +623,34 @@ class Engine:
     def generate_batch(
         self,
         prompts: list[str],
-        max_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
         parallel: int = 0,
         chat_format: bool = False,
     ) -> list[dict]:
         """
-        Run inference over a list of prompts **in parallel** using llama.cpp's
-        native multi-sequence batch API.
-
-        Args:
-            parallel: Max prompts per sub-batch.
-            chat_format: If True, wraps each prompt in the model's chat template.
-                      0 = auto (fit as many as the engine's n_ctx allows).
-                      >0 = fixed sub-batch size; the batch context is auto-
-                            scaled so all prompts fit regardless of n_ctx.
-
-        Returns a list of dicts:
-          {"prompt": str, "output": str, "tokens": int, "elapsed": float, "tok_per_sec": float}
+        Run inference over a list of prompts **in parallel**
         """
+        # Resolve sampling
+        if temperature is None:
+            temperature = float(self._config.get("temperature", 0.7))
+        if top_p is None:
+            top_p = float(self._config.get("top_p", 0.9))
+        if top_k is None:
+            top_k = int(self._config.get("top_k", 40))
+
+        # Fallback to persistent config
+        if max_tokens is None:
+            saved = self._config.get("max_output_tokens")
+            if saved == "auto":
+                # For batch, try to give each prompt at least 1/4 of the context 
+                # or a healthy default (2048) so long-form generation works.
+                max_tokens = min(2048, self._n_ctx // 4)
+            else:
+                # If nothing set, allow for generous output (2048) or model max
+                max_tokens = int(saved or 2048)
         all_results: list[dict] = []
         total_tokens = 0
         wall_start = time.perf_counter()
@@ -646,12 +942,32 @@ class Engine:
     def chat(
         self,
         system_prompt: str = "You are a helpful assistant.",
-        max_tokens: int = 512,
-        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
     ) -> None:
         """
         Simple REPL chat loop using the model's internal chat template.
         """
+        # Resolve sampling
+        if temperature is None:
+            temperature = float(self._config.get("temperature", 0.7))
+        if top_p is None:
+            top_p = float(self._config.get("top_p", 0.9))
+        if top_k is None:
+            top_k = int(self._config.get("top_k", 40))
+
+        # Fallback to persistent config
+        if max_tokens is None:
+            saved = self._config.get("max_output_tokens")
+            if saved == "auto":
+                # Dynamic auto in chat: use the remaining context window
+                # Start with a healthy default (4096) or context-max
+                max_tokens = min(4096, self._n_ctx // 2)
+            else:
+                # Absolute fallback if neither CLI nor config exists: 2048
+                max_tokens = int(saved or 2048)
         messages = [{"role": "system", "content": system_prompt}]
         print(f"\n\033[94m[chat]\033[0m Model: \033[1m{self._alias}\033[0m  (type 'exit' to quit)\n")
 
@@ -674,19 +990,32 @@ class Engine:
             print("\033[34mAssistant:\033[0m ", end="", flush=True)
             t0 = time.perf_counter()
 
-            # Use create_chat_completion to use the model's own template automatically
+            # Format full history with template
+            prompt = self.apply_chat_template(messages, add_generation_prompt=True)
+
+            # Auto in chat: use the remaining context window
+            # If max_tokens is None or still the default placeholder
+            if max_tokens is None or max_tokens == 4096:
+                 saved = self._config.get("max_output_tokens")
+                 if saved == "auto":
+                     input_toks = self._llm.tokenize(prompt.encode("utf-8"))
+                     margin = 10
+                     max_tokens = max(128, self._n_ctx - len(input_toks) - margin)
+                 else:
+                     max_tokens = int(saved or 1024)
+
             try:
-                for chunk in self._llm.create_chat_completion(
-                    messages=messages,
+                for chunk in self._llm(
+                    prompt=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    top_p=0.9,
+                    top_p=top_p,
+                    top_k=top_k,
                     stream=True,
-                    stop=self._custom_stop,
+                    stop=list(set(self._custom_stop)),
                 ):
-                    delta = chunk["choices"][0]["delta"]
-                    if "content" in delta:
-                        tok = delta["content"]
+                    tok = chunk["choices"][0]["text"]
+                    if tok:
                         print(tok, end="", flush=True)
                         tokens_out.append(tok)
             except Exception as e:

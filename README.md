@@ -14,10 +14,13 @@ uv pip install -e .
 # Optional: For strict GPU support (CUDA)
 CMAKE_ARGS="-DGGML_CUDA=on" uv pip install llama-cpp-python --reinstall --no-binary llama-cpp-python
 
-# 2. Download a model (e.g., Llama 3 8B)
+# 2. Register/Download a model 
 python cli.py load QuantFactory/Meta-Llama-3-8B-Instruct-GGUF --alias llama
 
-# 3. Chat with it!
+# 3. Configure it (Optional - set persistent context/limits)
+python cli.py config llama --n-ctx 8192 --max-output auto
+
+# 4. Chat with it!
 python cli.py chat llama
 ```
 
@@ -33,10 +36,20 @@ python cli.py chat llama
 | **batch** | `python cli.py batch <alias> --file <file> [--chat]` | Run inference over a text file of prompts (optional chat template) |
 | **bench** | `python cli.py bench <alias>` | Run throughput benchmarks to test your token speed |
 | **list** | `python cli.py list` | Show all registered models in your local registry |
-| **info** | `python cli.py info <alias>` | Output source and file details for a specific model |
+| **config** | `python cli.py config <alias>` | View and modify model configuration (**Context, Sampling, Token Limits**) |
 
-> [!NOTE]
-> All generation commands (`run`, `chat`, `batch`) stream output by default for a fluid user experience.
+> [!TIP]
+> **Persistent Tuning:** Use `config` to set your model's personality (temp, top-p) and resource limits (n-ctx) once. All subsequent `run`, `chat`, and `batch` commands will inherit these settings automatically!
+
+---
+
+## ✨ Interface & Experience
+
+The engine provides a professional-grade terminal experience:
+- **GENERATION Block:** Immediate feedback on resolved parameters (Temperature, Max Tokens, Mode) before every query.
+- **Dynamic Speed-Line:** High-accuracy `tokens/sec` and wall-clock time tracking for every generation.
+- **Granular VRAM Backtracking:** Automatically finds the absolute maximum layers your GPU can handle (1-layer precision).
+- **Segmented Model Support:** Native handling for multi-channel models like **GPT-OSS** (shows analysis/thinking phases clearly).
 
 ---
 
