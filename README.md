@@ -15,13 +15,13 @@ uv pip install -e .
 CMAKE_ARGS="-DGGML_CUDA=on" uv pip install llama-cpp-python --reinstall --no-binary llama-cpp-python
 
 # 2. Register/Download a model 
-python cli.py load QuantFactory/Meta-Llama-3-8B-Instruct-GGUF --alias llama
+python cli.py load unsloth/gpt-oss-20b-GGUF --alias gptoss_20b
 
 # 3. Configure it (Optional - set persistent context/limits)
-python cli.py config llama --n-ctx 8192 --max-output auto
+python cli.py config gptoss_20b --n-ctx 8192 --max-output auto
 
 # 4. Chat with it!
-python cli.py chat llama
+python cli.py chat gptoss_20b
 ```
 
 ---
@@ -79,7 +79,7 @@ Tuning your parameters based on your hardware is the key to maximizing tokens-pe
 
 **Example of an optimized run command:**
 ```bash
-python cli.py run llama --prompt "Explain quantum mechanics" --gpu-layers -1 --n-batch 1024
+python cli.py run gptoss_20b --prompt "Explain quantum mechanics" --gpu-layers -1 --n-batch 1024
 ```
 
 > `export LLM_GPU_LAYERS=-1`, `export LLM_N_BATCH=512`, `export LLM_N_THREADS=8`.
@@ -119,9 +119,9 @@ Models are downloaded to `./models/` and aliased in a small JSON registry at `./
 
 ```json
 {
-  "llama": {
-    "path": "./models/llama.gguf",
-    "source": "QuantFactory/Meta-Llama-3-8B-Instruct-GGUF"
+  "gptoss_20b": {
+    "path": "./models/gptoss_20b.gguf",
+    "source": "unsloth/gpt-oss-20b-GGUF"
   }
 }
 ```
