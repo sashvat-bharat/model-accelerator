@@ -4,6 +4,7 @@ results.json
 # Python / Environment
 .venv
 .env
+.zed
 __pycache__/
 *.py[cod]
 *$py.class

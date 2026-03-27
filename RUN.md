@@ -76,7 +76,7 @@ python cli.py config gptoss_20b --n-ctx 8192 --temp 0.8 --max-output 2048
 ### 📂 Batch Export
 Process thousands of prompts and save results directly to a JSON file:
 ```bash
-python cli.py batch gptoss_20b --file prompts.txt --parallel 10 --output results.json
+python cli.py batch gptoss_20b --file prompts.txt --parallel 10 --output results.json --chat
 ```
 
 ### 🌍 Environment Variables
