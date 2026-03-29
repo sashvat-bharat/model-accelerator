@@ -40,7 +40,7 @@ def cmd_load(args: argparse.Namespace) -> None:
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
-    # New behavior: destination is a directory named after the alias
+    # Destination is a directory named after the alias
     dest_dir = MODELS_DIR / alias
 
     # ---- HuggingFace repo  (hf://<org/repo> or plain <org/repo>) ----------
@@ -100,11 +100,8 @@ def _download_hf(repo_id: str, dest_dir: Path, filename: str | None) -> Path:
                 break
         print(f"[load] Auto-selected GGUF: {filename}")
 
-    # 3. Define allow/ignore patterns
-    # We want: 
-    #   - The selected GGUF file
-    #   - All config/tokenizer files (.json, .model, .txt)
-    #   - Ignore all OTHER .gguf files
+    # 3. Download ONLY the target GGUF file.
+    # The GGUF file natively contains all metadata (chat templates, configs, stops).
     other_ggufs = [f for f in gguf_files if f != filename]
     
     print(f"[load] Downloading {repo_id} (GGUF: {filename}) to {dest_dir} …")
@@ -112,7 +109,7 @@ def _download_hf(repo_id: str, dest_dir: Path, filename: str | None) -> Path:
     final_path = snapshot_download(
         repo_id=repo_id,
         local_dir=str(dest_dir),
-        allow_patterns=[filename, "*.json", "*.model", "*.txt", "*.py", "template", "params"],
+        allow_patterns=[filename],
         ignore_patterns=other_ggufs,
         local_dir_use_symlinks=False,
     )
@@ -163,19 +160,21 @@ def cmd_run(args: argparse.Namespace) -> None:
     # Always stream for a better UX unless explicitly disabled
     stream = not args.no_stream 
     
-    # Resolve and display generation parameters
-    # Fallback logic for display only (engine does the actual enforcement)
     disp_max = args.max_tokens or config_data.get("max_output_tokens") or "auto"
     disp_temp = args.temp
     if disp_temp is None:
         disp_temp = config_data.get("temperature", 0.7)
     
+    disp_top_p = args.top_p or config_data.get("top_p", 0.9)
+    disp_top_k = args.top_k or config_data.get("top_k", 40)
+    
     print(f"\033[1;36mGENERATION\033[0m")
     print(f"{'  Prompt':<12} : \"{prompt[:60]}{'...' if len(prompt)>60 else ''}\"")
     print(f"{'  Temp':<12} : {disp_temp:.2f}")
+    print(f"{'  Top-P':<12} : {disp_top_p:.2f}")
+    print(f"{'  Top-K':<12} : {disp_top_k}")
     if disp_max == "auto":
-        # Guess the auto value for display purposes similar to Engine
-        inp_len = len(prompt.split()) * 1.3 # Very rough guess
+        inp_len = len(prompt.split()) * 1.3
         resolved_max = max(128, int(engine._n_ctx - inp_len - 20))
         print(f"{'  Max Tokens':<12} : auto ({resolved_max} available)")
     else:
@@ -188,7 +187,10 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     if stream:
         for tok in engine.generate(prompt, max_tokens=max_tokens,
-                                   temperature=disp_temp, stream=True,
+                                   temperature=disp_temp,
+                                   top_p=args.top_p,
+                                   top_k=args.top_k,
+                                   stream=True,
                                    chat_format=args.chat):
             print(tok, end="", flush=True)
             tokens += 1
@@ -199,7 +201,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"\033[90m[{tokens} tokens | {tps:.1f} tok/s | {elapsed:.2f}s]\033[0m")
     else:
         output = engine.generate(prompt, max_tokens=args.max_tokens,
-                                 temperature=args.temp, stream=False,
+                                 temperature=args.temp,
+                                 top_p=args.top_p,
+                                 top_k=args.top_k,
+                                 stream=False,
                                  chat_format=args.chat)
         elapsed = time.perf_counter() - t0
         print(output)
@@ -227,11 +232,9 @@ def cmd_batch(args: argparse.Namespace) -> None:
 
     from engine import Engine, get_model_config
 
-    # Load config
     config_data = get_model_config(args.alias)
     n_ctx = args.n_ctx or config_data.get("configured_context_length")
 
-    # Resolve and display generation parameters
     disp_max = args.max_tokens or config_data.get("max_output_tokens") or "auto"
     print(f"\033[1;36mGENERATION (Batch)\033[0m")
     print(f"{'  Source':<12} : {args.file} ({len(prompts)} prompts)")
@@ -247,18 +250,18 @@ def cmd_batch(args: argparse.Namespace) -> None:
         n_threads=args.n_threads,
     )
 
-    # Let the engine resolve max_tokens from its persistent config/auto-logic
     max_tokens = args.max_tokens
 
     results = engine.generate_batch(
         prompts,
         max_tokens=max_tokens,
         temperature=args.temp,
+        top_p=args.top_p,
+        top_k=args.top_k,
         parallel=args.parallel,
         chat_format=args.chat,
     )
 
-    # Optionally write results to JSON
     if args.output:
         out_path = Path(args.output)
         out_path.write_text(json.dumps(results, indent=2))
@@ -278,7 +281,6 @@ def cmd_batch(args: argparse.Namespace) -> None:
 def cmd_chat(args: argparse.Namespace) -> None:
     from engine import Engine, get_model_config
 
-    # Load config
     config_data = get_model_config(args.alias)
     n_ctx = args.n_ctx or config_data.get("configured_context_length")
 
@@ -297,6 +299,8 @@ def cmd_chat(args: argparse.Namespace) -> None:
         system_prompt=args.system,
         max_tokens=args.max_tokens,
         temperature=temp,
+        top_p=args.top_p,
+        top_k=args.top_k,
     )
 
 
@@ -318,14 +322,12 @@ def cmd_list(_args: argparse.Namespace) -> None:
         if not p.exists():
             size = "MISSING"
         elif p.is_dir():
-            # Sum up all files in the directory
             total_bytes = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
             size = f"{total_bytes / 1e9:.2f}G"
         else:
             size = f"{p.stat().st_size / 1e9:.2f}G"
         print(f"{alias:<20}  {size:>8}  {meta['source']}")
     print()
-
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +342,6 @@ def cmd_config(args: argparse.Namespace) -> None:
     if not caps.get("exists"):
         sys.exit(f"[error] Unknown or missing model alias '{alias}'")
         
-    # 1. Update config if flags provided
     new_config = {}
     if args.n_ctx:
         new_config["configured_context_length"] = args.n_ctx
@@ -356,16 +357,13 @@ def cmd_config(args: argparse.Namespace) -> None:
         new_config["top_k"] = args.top_k
         
     if new_config:
-        # Load current to validate
         current = get_model_config(alias)
         current.update(new_config)
         
-        # Validation Logic
         ctx = current.get("configured_context_length") or caps["total_context_length"]
         inp = current.get("max_input_tokens")
         out = current.get("max_output_tokens")
         
-        # Resolve 'auto' for validation
         v_inp = 0 if inp == "auto" else (inp or 0)
         v_out = 0 if out == "auto" else (out or 0)
         
@@ -375,10 +373,8 @@ def cmd_config(args: argparse.Namespace) -> None:
         set_model_config(alias, current)
         print(f"[config] Updated settings for '{alias}'.")
 
-    # 2. Display Result
     config = get_model_config(alias)
     
-    # Calculate Auto Values for Display
     disp_ctx = config.get("configured_context_length") or caps["total_context_length"]
     disp_inp = config.get("max_input_tokens")
     disp_out = config.get("max_output_tokens")
@@ -419,10 +415,6 @@ def cmd_config(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def cmd_bench(args: argparse.Namespace) -> None:
-    """
-    Quick throughput benchmark — runs the same prompt N times and reports
-    average tokens/sec.  Useful for tuning n_batch / n_gpu_layers.
-    """
     from engine import Engine
 
     engine = Engine(
@@ -443,7 +435,7 @@ def cmd_bench(args: argparse.Namespace) -> None:
         raw = engine._llm(
             prompt=prompt,
             max_tokens=args.max_tokens,
-            temperature=0.0,   # greedy for reproducibility
+            temperature=0.0,
             echo=False,
             stream=False,
         )
@@ -466,7 +458,6 @@ def cmd_bench(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def _add_perf_args(p: argparse.ArgumentParser) -> None:
-    """Common performance-tuning flags shared by run/batch/chat/bench."""
     import multiprocessing
     import os
     p.add_argument("--gpu-layers", default=None,
@@ -481,6 +472,10 @@ def _add_perf_args(p: argparse.ArgumentParser) -> None:
                    help="Max tokens to generate (persisted default available via 'config')")
     p.add_argument("--temp", type=float, default=None,
                    help="Sampling temperature (default: 0.7 or persisted value)")
+    p.add_argument("--top-p", type=float, default=None,
+                   help="Top-P sampling (default: 0.9 or persisted value)")
+    p.add_argument("--top-k", type=int, default=None,
+                   help="Top-K sampling (default: 40 or persisted value)")
     p.add_argument("--chat", action="store_true",
                    help="Apply the model's internal chat template to the prompt")
 
@@ -494,49 +489,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ---- load ----
     p_load = sub.add_parser("load", help="Download & register a GGUF model")
     p_load.add_argument("source",
                         help="HF repo id  (e.g. 'TheBloke/Mistral-7B-v0.1-GGUF')  "
                              "or full hf:// URI or HTTPS URL or local path")
     p_load.add_argument("--alias", required=True, help="Short name to refer to this model")
-    p_load.add_argument("--file", default=None,
-                        help="Specific GGUF filename inside the HF repo")
+    p_load.add_argument("--file", default=None, help="Specific GGUF filename inside the HF repo")
     p_load.set_defaults(func=cmd_load)
 
     p_run = sub.add_parser("run", help="Generate text for a single prompt")
     p_run.add_argument("alias", help="Model alias")
     p_run.add_argument("--prompt", required=True, help="Input prompt")
-    p_run.add_argument("--no-stream", action="store_true",
-                       help="Disable streaming output")
+    p_run.add_argument("--no-stream", action="store_true", help="Disable streaming output")
     _add_perf_args(p_run)
     p_run.set_defaults(func=cmd_run)
 
-    # ---- batch ----
     p_batch = sub.add_parser("batch", help="Run inference over a file of prompts")
     p_batch.add_argument("alias", help="Model alias")
-    p_batch.add_argument("--file", required=True,
-                         help="Text file with one prompt per line")
-    p_batch.add_argument("--output", default=None,
-                         help="Write JSON results to this file")
-    p_batch.add_argument("--parallel", type=int, default=0,
-                         help="Max prompts per parallel sub-batch (0=auto, fits context window)")
+    p_batch.add_argument("--file", required=True, help="Text file with one prompt per line")
+    p_batch.add_argument("--output", default=None, help="Write JSON results to this file")
+    p_batch.add_argument("--parallel", type=int, default=0, help="Max prompts per parallel sub-batch (0=auto)")
     _add_perf_args(p_batch)
     p_batch.set_defaults(func=cmd_batch)
 
-    # ---- chat ----
     p_chat = sub.add_parser("chat", help="Interactive chat REPL")
     p_chat.add_argument("alias", help="Model alias")
-    p_chat.add_argument("--system", default="You are a helpful assistant.",
-                        help="System prompt")
+    p_chat.add_argument("--system", default="You are a helpful assistant.", help="System prompt")
     _add_perf_args(p_chat)
     p_chat.set_defaults(func=cmd_chat)
 
-    # ---- list ----
     p_list = sub.add_parser("list", help="Show all registered models")
     p_list.set_defaults(func=cmd_list)
 
-    # ---- config ----
     p_config = sub.add_parser("config", help="View or modify model configuration")
     p_config.add_argument("alias", help="Model alias")
     p_config.add_argument("--n-ctx", type=int, help="Adjust total context window")
@@ -547,22 +531,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_config.add_argument("--top-k", type=int, help="Set default Top-K sampling")
     p_config.set_defaults(func=cmd_config)
 
-    # ---- bench ----
     p_bench = sub.add_parser("bench", help="Throughput benchmark")
     p_bench.add_argument("alias", help="Model alias")
-    p_bench.add_argument("--prompt", default="Tell me a short story about a robot.",
-                         help="Prompt to repeat")
-    p_bench.add_argument("--runs", type=int, default=3,
-                          help="Number of benchmark runs (default: 3)")
+    p_bench.add_argument("--prompt", default="Tell me a short story about a robot.", help="Prompt to repeat")
+    p_bench.add_argument("--runs", type=int, default=3, help="Number of benchmark runs (default: 3)")
     _add_perf_args(p_bench)
     p_bench.set_defaults(func=cmd_bench)
 
     return parser
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = build_parser()
