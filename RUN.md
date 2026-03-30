@@ -1,4 +1,4 @@
-# Command Reference
+# Command Reference for Model Accelerator
 
 ## 🛠 Parameters & Flags Description
 
