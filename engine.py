@@ -25,6 +25,7 @@ from rich.console import Console
 
 console = Console()
 
+
 @contextmanager
 def suppress_c_stderr():
     fd = sys.stderr.fileno()
@@ -38,23 +39,27 @@ def suppress_c_stderr():
         os.close(original_stderr)
         os.close(devnull)
 
+
 # ---------------------------------------------------------------------------
 # Default Inference & Sampling Parameters
 # ---------------------------------------------------------------------------
 
-_DEFAULT_N_CTX         = int(os.environ.get("LLM_N_CTX", "4096"))
-_DEFAULT_N_BATCH       = int(os.environ.get("LLM_N_BATCH", "512"))
-_DEFAULT_N_THREADS     = int(os.environ.get("LLM_N_THREADS", str(min(multiprocessing.cpu_count(), 8))))
-_MAX_THREADS_BATCH     = multiprocessing.cpu_count()
+_DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", "4096"))
+_DEFAULT_N_BATCH = int(os.environ.get("LLM_N_BATCH", "512"))
+_DEFAULT_N_THREADS = int(
+    os.environ.get("LLM_N_THREADS", str(min(multiprocessing.cpu_count(), 8)))
+)
+_MAX_THREADS_BATCH = multiprocessing.cpu_count()
 
-_DEFAULT_TEMPERATURE   = 0.7
-_DEFAULT_TOP_P         = 1.0
-_DEFAULT_TOP_K         = 0
-_DEFAULT_MAX_TOKENS    = "auto"
+_DEFAULT_TEMPERATURE = 0.7
+_DEFAULT_TOP_P = 1.0
+_DEFAULT_TOP_K = 0
+_DEFAULT_MAX_TOKENS = "auto"
 
 # ---------------------------------------------------------------------------
 # Dataclasses & Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class ModelCapabilities:
@@ -66,6 +71,7 @@ class ModelCapabilities:
     total_context_length: int
     total_layers: int
 
+
 @dataclass
 class ModelConfig:
     configured_context_length: int | None = None
@@ -74,6 +80,7 @@ class ModelConfig:
     temperature: float = _DEFAULT_TEMPERATURE
     top_p: float = _DEFAULT_TOP_P
     top_k: int = _DEFAULT_TOP_K
+
 
 # ---------------------------------------------------------------------------
 # Registry helpers
@@ -95,9 +102,11 @@ def _load_registry() -> dict:
             return json.load(f)
     return {}
 
+
 def _save_registry(reg: dict) -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     REGISTRY_FILE.write_text(json.dumps(reg, indent=2))
+
 
 def register_model(alias: str, path: str, source: str) -> None:
     reg = _load_registry()
@@ -105,12 +114,15 @@ def register_model(alias: str, path: str, source: str) -> None:
     _save_registry(reg)
     console.print(f"[dim green][registry][/] '{alias}' → {path}")
 
+
 def resolve_model(alias: str) -> str:
     reg = _load_registry()
     if alias not in reg:
-        console.print(f"[bold red][error][/] Unknown alias '{alias}'. Run: python cli.py load <url> --alias {alias}")
+        console.print(
+            f"[bold red][error][/] Unknown alias '{alias}'. Run: python cli.py load <url> --alias {alias}"
+        )
         sys.exit(1)
-        
+
     path = Path(reg[alias]["path"])
     if not path.exists():
         console.print(f"[bold red][error][/] Model path missing: {path}")
@@ -119,23 +131,27 @@ def resolve_model(alias: str) -> str:
     if path.is_dir():
         ggufs = list(path.glob("*.gguf"))
         if not ggufs:
-            console.print(f"[bold red][error][/] No .gguf file found in directory: {path}")
+            console.print(
+                f"[bold red][error][/] No .gguf file found in directory: {path}"
+            )
             sys.exit(1)
         return str(ggufs[0])
-    
+
     return str(path)
+
 
 def list_models() -> dict:
     return _load_registry()
 
+
 def get_model_capabilities(alias: str) -> ModelCapabilities:
     """Read native GGUF metadata directly to determine limits & layers."""
     from llama_cpp import Llama
-    
+
     reg = _load_registry().get(alias, {})
     path_str = reg.get("path", "")
     p = Path(path_str) if path_str else Path()
-    
+
     caps = ModelCapabilities(
         alias=alias,
         source=reg.get("source", "local"),
@@ -143,40 +159,47 @@ def get_model_capabilities(alias: str) -> ModelCapabilities:
         exists=p.exists(),
         size=f"{p.stat().st_size / 1e9:.2f} GB" if p.exists() else "0 GB",
         total_context_length=_DEFAULT_N_CTX,
-        total_layers=32 # Fallback assumption
+        total_layers=32,  # Fallback assumption
     )
-    
+
     if p.exists():
         try:
             actual_file = resolve_model(alias)
             with suppress_c_stderr():
                 temp_llm = Llama(model_path=actual_file, vocab_only=True, verbose=False)
-                
+
                 for k, v in temp_llm.metadata.items():
                     # Parse Context Length
-                    if k.endswith(".context_length") and not k.endswith(".original_context_length"):
-                        try: caps.total_context_length = int(v)
-                        except (ValueError, TypeError): pass
-                        
+                    if k.endswith(".context_length") and not k.endswith(
+                        ".original_context_length"
+                    ):
+                        try:
+                            caps.total_context_length = int(v)
+                        except (ValueError, TypeError):
+                            pass
+
                     # Parse EXACT Layer Count (block_count)
                     if k.endswith(".block_count"):
-                        try: caps.total_layers = int(v)
-                        except (ValueError, TypeError): pass
-                        
+                        try:
+                            caps.total_layers = int(v)
+                        except (ValueError, TypeError):
+                            pass
+
                 del temp_llm
         except Exception:
             pass
-            
+
     return caps
+
 
 def get_model_config(alias: str) -> ModelConfig:
     reg = _load_registry()
     if alias not in reg:
         return ModelConfig()
-        
+
     model_dir = Path(reg[alias]["path"])
     params_path = model_dir / "params.json"
-    
+
     if params_path.exists():
         try:
             with params_path.open() as f:
@@ -186,24 +209,26 @@ def get_model_config(alias: str) -> ModelConfig:
                 return ModelConfig(**filtered_data)
         except Exception:
             pass
-            
+
     return ModelConfig()
+
 
 def set_model_config(alias: str, config: ModelConfig) -> None:
     reg = _load_registry()
     if alias not in reg:
         return
-        
+
     model_dir = Path(reg[alias]["path"])
     model_dir.mkdir(parents=True, exist_ok=True)
     params_path = model_dir / "params.json"
-    
+
     params_path.write_text(json.dumps(asdict(config), indent=2))
 
 
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
+
 
 class Engine:
     def __init__(
@@ -219,7 +244,7 @@ class Engine:
         model_path = resolve_model(alias)
         config = get_model_config(alias)
         caps = get_model_capabilities(alias)
-        
+
         # Resolve Context
         if n_ctx is None:
             n_ctx = config.configured_context_length or _DEFAULT_N_CTX
@@ -233,13 +258,13 @@ class Engine:
 
         # Resolve exact target layers (+1 for output projection head)
         exact_model_layers = caps.total_layers + 1
-        
+
         if n_gpu_layers == "max" or n_gpu_layers is None:
-             gpu_layers = exact_model_layers
-             is_auto = True
+            gpu_layers = exact_model_layers
+            is_auto = True
         else:
-             gpu_layers = int(n_gpu_layers)
-             is_auto = False
+            gpu_layers = int(n_gpu_layers)
+            is_auto = False
 
         self._config = config
         self._caps = caps
@@ -250,22 +275,31 @@ class Engine:
         console.print(f"         path       : [dim]{model_path}[/]")
         console.print(f"         n_ctx      : [yellow]{n_ctx}[/]")
         console.print(f"         n_batch    : [yellow]{n_batch}[/]")
-        console.print(f"         n_threads  : {n_threads} (Eval) / {_MAX_THREADS_BATCH} (Prefill)")
-        console.print(f"         gpu_layers : [green]{gpu_layers}[/] {'(Auto-Max)' if is_auto else '(Forced)'}")
+        console.print(
+            f"         n_threads  : {n_threads} (Eval) / {_MAX_THREADS_BATCH} (Prefill)"
+        )
+        console.print(
+            f"         gpu_layers : [green]{gpu_layers}[/] {'(Auto-Max)' if is_auto else '(Forced)'}"
+        )
 
         # Safety patch for some environments
         import llama_cpp._internals
+
         original_del = llama_cpp._internals.LlamaModel.__del__
+
         def safe_del(obj):
-            try: original_del(obj)
-            except Exception: pass
+            try:
+                original_del(obj)
+            except Exception:
+                pass
+
         llama_cpp._internals.LlamaModel.__del__ = safe_del
 
         self._llm = None
         max_attempts = gpu_layers + 1
         attempts = 0
         hit_oom = False
-        
+
         while self._llm is None and attempts < max_attempts:
             try:
                 with suppress_c_stderr():
@@ -280,81 +314,131 @@ class Engine:
                         use_mmap=True,
                         flash_attn=True,
                     )
-                
+
                 # --- Dynamic Compute Margin ---
                 # If we had to step down due to OOM, `gpu_layers` puts VRAM exactly at 100%.
                 # We need to leave a math buffer for generating text, else it hard-crashes.
                 if hit_oom and gpu_layers > 0:
-                    margin = max(2, int(exact_model_layers * 0.06)) # ~6% of layers buffer
+                    margin = max(
+                        2, int(exact_model_layers * 0.06)
+                    )  # ~6% of layers buffer
                     safe_layers = max(0, gpu_layers - margin)
-                    
-                    console.print(f"[dim yellow]  → 100% VRAM saturation detected at {gpu_layers} layers.[/]")
-                    console.print(f"[dim yellow]  → Applying {margin}-layer compute margin. Reloading at {safe_layers}...[/]")
-                    
+
+                    console.print(
+                        f"[dim yellow]  → 100% VRAM saturation detected at {gpu_layers} layers.[/]"
+                    )
+                    console.print(
+                        f"[dim yellow]  → Applying {margin}-layer compute margin. Reloading at {safe_layers}...[/]"
+                    )
+
                     # Hard destroy the overloaded instance to clear GPU memory immediately
                     del self._llm
                     self._llm = None
                     gc.collect()
                     time.sleep(0.3)
-                    
+
                     # Refresh for the safe pass
                     gpu_layers = safe_layers
-                    hit_oom = False # Act as a fresh load without OOM tracking
-                    continue # Re-enter the while loop with the safe layer count
+                    hit_oom = False  # Act as a fresh load without OOM tracking
+                    continue  # Re-enter the while loop with the safe layer count
 
             except (ValueError, RuntimeError) as e:
                 attempts += 1
                 hit_oom = True
                 if gpu_layers <= 0:
-                    raise RuntimeError(f"Engine failed to load even on CPU. Out of RAM? Error: {e}")
-                
+                    raise RuntimeError(
+                        f"Engine failed to load even on CPU. Out of RAM? Error: {e}"
+                    )
+
                 old_layers = gpu_layers
                 gpu_layers -= 1
-                
+
                 if is_auto:
-                    console.print(f"[yellow][warn][/] VRAM limit reached at {old_layers} layers. Retrying with {gpu_layers}...")
+                    console.print(
+                        f"[yellow][warn][/] VRAM limit reached at {old_layers} layers. Retrying with {gpu_layers}..."
+                    )
                 else:
-                    console.print(f"[yellow][warn][/] Forced {old_layers} layers failed (OOM). Self-healing to {gpu_layers}...")
-                
+                    console.print(
+                        f"[yellow][warn][/] Forced {old_layers} layers failed (OOM). Self-healing to {gpu_layers}..."
+                    )
+
                 time.sleep(0.1)
 
         if not self._llm:
-            raise RuntimeError(f"Failed to load engine for '{alias}'. Exhausted all {max_attempts} attempts.")
-            
+            raise RuntimeError(
+                f"Failed to load engine for '{alias}'. Exhausted all {max_attempts} attempts."
+            )
+
         if self._llm.metadata.get("tokenizer.chat_template"):
-            console.print("[dim green][engine] Native Chat Template detected in GGUF metadata.[/]")
+            console.print(
+                "[dim green][engine] Native Chat Template detected in GGUF metadata.[/]"
+            )
         else:
-            console.print("[yellow][warn] No native chat template found in GGUF. Using fallback.[/]")
-            
+            console.print(
+                "[yellow][warn] No native chat template found in GGUF. Using fallback.[/]"
+            )
+
         console.print("[bold green][engine] Ready.[/]\n")
 
-    def apply_chat_template(self, messages: list[dict], add_generation_prompt: bool = True) -> str:
+    def apply_chat_template(
+        self,
+        messages: list[dict],
+        add_generation_prompt: bool = True,
+        enable_thinking: bool = False,
+    ) -> str:
         """Evaluates native GGUF internal Jinja template."""
         template = self._llm.metadata.get("tokenizer.chat_template")
         if template:
             try:
                 import jinja2
+
                 env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+
                 def _raise_err(msg):
                     raise ValueError(msg)
-                env.globals['raise_exception'] = _raise_err
-                
-                bos_token = self._llm.detokenize([self._llm.token_bos()]).decode("utf-8") if self._llm.token_bos() != -1 else ""
-                eos_token = self._llm.detokenize([self._llm.token_eos()]).decode("utf-8") if self._llm.token_eos() != -1 else ""
-                
-                return env.from_string(template).render(
-                    messages=messages, bos_token=bos_token, eos_token=eos_token, 
-                    add_generation_prompt=add_generation_prompt
+
+                env.globals["raise_exception"] = _raise_err
+
+                bos_token = (
+                    self._llm.detokenize([self._llm.token_bos()]).decode("utf-8")
+                    if self._llm.token_bos() != -1
+                    else ""
                 )
+                eos_token = (
+                    self._llm.detokenize([self._llm.token_eos()]).decode("utf-8")
+                    if self._llm.token_eos() != -1
+                    else ""
+                )
+
+                render_kwargs = dict(
+                    messages=messages,
+                    bos_token=bos_token,
+                    eos_token=eos_token,
+                    add_generation_prompt=add_generation_prompt,
+                )
+                if enable_thinking:
+                    render_kwargs["enable_thinking"] = True
+
+                return env.from_string(template).render(**render_kwargs)
             except Exception as e:
-                console.print(f"[yellow][warn][/] Failed to evaluate native template: {e}. Falling back.")
-        
+                console.print(
+                    f"[yellow][warn][/] Failed to evaluate native template: {e}. Falling back."
+                )
+
         prompt = ""
         for m in messages:
             prompt += f"[{m['role'].upper()}]: {m['content']}\n"
         if add_generation_prompt:
             prompt += "[ASSISTANT]:"
         return prompt
+
+    def _detect_think_capable(self) -> bool:
+        """Check if the model's chat template supports thinking mode."""
+        template = self._llm.metadata.get("tokenizer.chat_template", "")
+        if not template:
+            return False
+        think_markers = ["<think>", "<think>", "thinking_prefix", "thinking_suffix"]
+        return any(marker in template for marker in think_markers)
 
     def generate(
         self,
@@ -365,9 +449,12 @@ class Engine:
         top_k: int | None = None,
         stream: bool = False,
         chat_format: bool = False,
+        think: bool = False,
     ) -> str | Iterator[str]:
-        
-        temperature = temperature if temperature is not None else self._config.temperature
+
+        temperature = (
+            temperature if temperature is not None else self._config.temperature
+        )
         top_p = top_p if top_p is not None else self._config.top_p
         top_k = top_k if top_k is not None else self._config.top_k
 
@@ -379,33 +466,61 @@ class Engine:
             else:
                 max_tokens = int(saved)
 
-        if chat_format:
+        use_thinking = think and chat_format and self._detect_think_capable()
+
+        if chat_format and not use_thinking:
             messages = [{"role": "user", "content": prompt}]
             if stream:
+
                 def _gen():
                     for chunk in self._llm.create_chat_completion(
-                        messages=messages, max_tokens=max_tokens, temperature=temperature,
-                        top_p=top_p, top_k=top_k, stream=True
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        stream=True,
                     ):
                         delta = chunk["choices"][0].get("delta", {})
                         if "content" in delta:
                             yield delta["content"]
+
                 return _gen()
-            
+
             result = self._llm.create_chat_completion(
-                messages=messages, max_tokens=max_tokens, temperature=temperature,
-                top_p=top_p, top_k=top_k,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
             )
             return result["choices"][0]["message"]["content"]
 
+        if use_thinking:
+            prompt_text = self.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        else:
+            prompt_text = prompt
+
         kwargs = dict(
-            prompt=prompt, max_tokens=max_tokens, temperature=temperature,
-            top_p=top_p, top_k=top_k, echo=False, stream=stream,
+            prompt=prompt_text,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            echo=False,
+            stream=stream,
         )
 
         if stream:
+
             def _gen():
-                for chunk in self._llm(**kwargs): yield chunk["choices"][0]["text"]
+                for chunk in self._llm(**kwargs):
+                    yield chunk["choices"][0]["text"]
+
             return _gen()
 
         return self._llm(**kwargs)["choices"][0]["text"]
@@ -423,64 +538,94 @@ class Engine:
         top_k: int | None = None,
         parallel: int = 0,
         chat_format: bool = False,
+        think: bool = False,
     ) -> list[dict]:
-        
-        temperature = temperature if temperature is not None else self._config.temperature
+
+        temperature = (
+            temperature if temperature is not None else self._config.temperature
+        )
         top_p = top_p if top_p is not None else self._config.top_p
         top_k = top_k if top_k is not None else self._config.top_k
 
         if max_tokens is None:
             saved = self._config.max_output_tokens
             max_tokens = min(2048, self._n_ctx // 4) if saved == "auto" else int(saved)
-                
+
         all_results: list[dict] = []
         total_tokens = 0
         wall_start = time.perf_counter()
         done_count = 0
 
         tokenized = []
+        use_thinking = think and chat_format and self._detect_think_capable()
         for p in prompts:
-            actual_prompt = self.apply_chat_template([{"role": "user", "content": p}]) if chat_format else p
-            tokenized.append(self._llm.tokenize(actual_prompt.encode("utf-8"), add_bos=True))
+            if chat_format:
+                actual_prompt = self.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    add_generation_prompt=True,
+                    enable_thinking=use_thinking,
+                )
+            else:
+                actual_prompt = p
+            tokenized.append(
+                self._llm.tokenize(actual_prompt.encode("utf-8"), add_bos=True)
+            )
 
         sub_batches = self._calculate_sub_batches(tokenized, max_tokens, parallel)
         n_sub = len(sub_batches)
-        
+
         if n_sub > 1:
-            console.print(f"[dim cyan][batch][/] Split into {n_sub} sub-batches (parallel={'auto' if parallel == 0 else parallel})")
+            console.print(
+                f"[dim cyan][batch][/] Split into {n_sub} sub-batches (parallel={'auto' if parallel == 0 else parallel})"
+            )
 
         for sb_i, sb_indices in enumerate(sub_batches):
             sb_prompts = [prompts[i] for i in sb_indices]
-            sb_tokens  = [tokenized[i] for i in sb_indices]
-            
+            sb_tokens = [tokenized[i] for i in sb_indices]
+
             if n_sub > 1:
-                console.print(f"\n[bold cyan][batch][/] Sub-batch {sb_i+1}/{n_sub}: {len(sb_indices)} prompts parallel")
+                console.print(
+                    f"\n[bold cyan][batch][/] Sub-batch {sb_i + 1}/{n_sub}: {len(sb_indices)} prompts parallel"
+                )
 
             sb_results = self._parallel_decode(
-                sb_prompts, sb_tokens, max_tokens, temperature, top_p, top_k,
-                start_idx=done_count, total=len(prompts)
+                sb_prompts,
+                sb_tokens,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                start_idx=done_count,
+                total=len(prompts),
             )
 
-            for r in sb_results: total_tokens += r["tokens"]
+            for r in sb_results:
+                total_tokens += r["tokens"]
             all_results.extend(sb_results)
             done_count += len(sb_indices)
 
         wall = time.perf_counter() - wall_start
         agg = total_tokens / wall if wall > 0 else 0.0
-        console.print(f"\n[bold green][batch][/] {total_tokens} total tokens in {wall:.2f}s → {agg:.1f} tok/s aggregate")
+        console.print(
+            f"\n[bold green][batch][/] {total_tokens} total tokens in {wall:.2f}s → {agg:.1f} tok/s aggregate"
+        )
         return all_results
 
     def _calculate_sub_batches(self, tokenized, max_tokens, parallel):
         if parallel > 0:
-            return [list(range(start, min(start + parallel, len(tokenized)))) for start in range(0, len(tokenized), parallel)]
-        
+            return [
+                list(range(start, min(start + parallel, len(tokenized))))
+                for start in range(0, len(tokenized), parallel)
+            ]
+
         sub_batches, current_batch, current_ctx_usage = [], [], 0
         n_ctx = self._llm._n_ctx
 
         for idx, toks in enumerate(tokenized):
             seq_budget = len(toks) + max_tokens
             if seq_budget > n_ctx:
-                if current_batch: sub_batches.append(current_batch)
+                if current_batch:
+                    sub_batches.append(current_batch)
                 sub_batches.append([idx])
                 current_batch, current_ctx_usage = [], 0
                 continue
@@ -490,30 +635,49 @@ class Engine:
             current_batch.append(idx)
             current_ctx_usage += seq_budget
 
-        if current_batch: sub_batches.append(current_batch)
+        if current_batch:
+            sub_batches.append(current_batch)
         return sub_batches
 
-    def _parallel_decode(self, prompts, prompt_tokens, max_tokens, temperature, top_p, top_k, start_idx, total) -> list[dict]:
+    def _parallel_decode(
+        self,
+        prompts,
+        prompt_tokens,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        start_idx,
+        total,
+    ) -> list[dict]:
         import llama_cpp.llama_cpp as ll
-        
+
         llm = self._llm
         n_seq = len(prompts)
         vocab = llm._model.vocab
 
         # 1. Init
-        batch_ctx, samplers = self._init_parallel_context(ll, prompt_tokens, max_tokens, temperature, top_p, top_k)
-        
+        batch_ctx, samplers = self._init_parallel_context(
+            ll, prompt_tokens, max_tokens, temperature, top_p, top_k
+        )
+
         # 2. State setup
         generated: list[list[int]] = [[] for _ in range(n_seq)]
         seq_pos: list[int] = [0] * n_seq
         finished: list[bool] = [False] * n_seq
-        
+
         t0 = time.perf_counter()
 
         # 3. Execution Phases
-        last_tokens = self._parallel_phase1_prefill(ll, batch_ctx, prompt_tokens, seq_pos)
-        self._parallel_phase1_5_first_decode(ll, batch_ctx, samplers, vocab, last_tokens, generated, finished)
-        self._parallel_phase2_autoregressive(ll, batch_ctx, samplers, vocab, max_tokens, seq_pos, generated, finished)
+        last_tokens = self._parallel_phase1_prefill(
+            ll, batch_ctx, prompt_tokens, seq_pos
+        )
+        self._parallel_phase1_5_first_decode(
+            ll, batch_ctx, samplers, vocab, last_tokens, generated, finished
+        )
+        self._parallel_phase2_autoregressive(
+            ll, batch_ctx, samplers, vocab, max_tokens, seq_pos, generated, finished
+        )
 
         elapsed = time.perf_counter() - t0
 
@@ -525,52 +689,73 @@ class Engine:
         for seq_id in range(n_seq):
             text = llm.detokenize(generated[seq_id]).decode("utf-8", errors="replace")
             n_tok = len(generated[seq_id])
-            results.append({
-                "prompt": prompts[seq_id], "output": text, "tokens": n_tok,
-                "elapsed": round(elapsed, 3), "tok_per_sec": round(tok_per_sec, 1),
-            })
-            console.print(f"  [dim][{start_idx + seq_id + 1}/{total}][/] {n_tok} tokens  (parallel batch)")
+            results.append(
+                {
+                    "prompt": prompts[seq_id],
+                    "output": text,
+                    "tokens": n_tok,
+                    "elapsed": round(elapsed, 3),
+                    "tok_per_sec": round(tok_per_sec, 1),
+                }
+            )
+            console.print(
+                f"  [dim][{start_idx + seq_id + 1}/{total}][/] {n_tok} tokens  (parallel batch)"
+            )
 
-        console.print(f"  → decoded {n_seq} prompts in {elapsed:.2f}s — {total_gen} tokens total — [bold]{tok_per_sec:.1f} tok/s[/] effective")
+        console.print(
+            f"  → decoded {n_seq} prompts in {elapsed:.2f}s — {total_gen} tokens total — [bold]{tok_per_sec:.1f} tok/s[/] effective"
+        )
 
-        for s in samplers: s.close()
+        for s in samplers:
+            s.close()
         ll.llama_free(batch_ctx)
         return results
 
-    def _init_parallel_context(self, ll, prompt_tokens, max_tokens, temperature, top_p, top_k):
+    def _init_parallel_context(
+        self, ll, prompt_tokens, max_tokens, temperature, top_p, top_k
+    ):
         llm = self._llm
         n_seq = len(prompt_tokens)
         required_ctx = sum(len(t) + max_tokens for t in prompt_tokens)
-        
+
         ctx_params = ll.llama_context_default_params()
         ctx_params.n_ctx = max(required_ctx, llm.context_params.n_ctx)
         ctx_params.n_batch = max(llm.context_params.n_batch, n_seq)
         ctx_params.n_seq_max = n_seq
         ctx_params.n_threads = llm.context_params.n_threads
         ctx_params.n_threads_batch = _MAX_THREADS_BATCH
-        
-        for attr in ['flash_attn', 'flash_attn_type', 'attention_type', 'offload_kqv']:
+
+        for attr in ["flash_attn", "flash_attn_type", "attention_type", "offload_kqv"]:
             if hasattr(llm.context_params, attr):
                 setattr(ctx_params, attr, getattr(llm.context_params, attr))
 
         batch_ctx = ll.llama_init_from_model(llm.model, ctx_params)
-        if batch_ctx is None: raise RuntimeError("Failed to create batch context. VRAM exhausted.")
+        if batch_ctx is None:
+            raise RuntimeError("Failed to create batch context. VRAM exhausted.")
 
-        samplers = [llm._init_sampler(
-            temp=temperature, top_p=top_p, top_k=top_k, min_p=0.05,
-            repeat_penalty=1.1, frequency_penalty=0.1, presence_penalty=0.1
-        ) for _ in range(n_seq)]
-        
+        samplers = [
+            llm._init_sampler(
+                temp=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=0.05,
+                repeat_penalty=1.1,
+                frequency_penalty=0.1,
+                presence_penalty=0.1,
+            )
+            for _ in range(n_seq)
+        ]
+
         return batch_ctx, samplers
 
     def _parallel_phase1_prefill(self, ll, batch_ctx, prompt_tokens, seq_pos):
         non_last_prefill, last_tokens = [], []
         n_batch = self._llm.n_batch
-        
+
         for seq_id, toks in enumerate(prompt_tokens):
             for i, tok in enumerate(toks[:-1]):
                 non_last_prefill.append((tok, i, seq_id))
-            last_tokens.append((toks[-1], len(toks)-1, seq_id))
+            last_tokens.append((toks[-1], len(toks) - 1, seq_id))
             seq_pos[seq_id] = len(toks)
 
         for chunk_start in range(0, len(non_last_prefill), n_batch):
@@ -582,40 +767,55 @@ class Engine:
                 batch.seq_id[j][0], batch.logits[j] = seq_id, False
             ll.llama_decode(batch_ctx, batch)
             ll.llama_batch_free(batch)
-            
+
         return last_tokens
 
-    def _parallel_phase1_5_first_decode(self, ll, batch_ctx, samplers, vocab, last_tokens, generated, finished):
+    def _parallel_phase1_5_first_decode(
+        self, ll, batch_ctx, samplers, vocab, last_tokens, generated, finished
+    ):
         n_seq = len(last_tokens)
         batch = ll.llama_batch_init(n_seq, 0, 1)
         batch.n_tokens = n_seq
-        
+
         for j, (tok, pos, seq_id) in enumerate(last_tokens):
             batch.token[j], batch.pos[j], batch.n_seq_id[j] = tok, pos, 1
             batch.seq_id[j][0], batch.logits[j] = seq_id, True
-            
+
         ll.llama_decode(batch_ctx, batch)
-        
+
         for seq_i in range(n_seq):
-            seq_id = last_tokens[seq_i][2] 
+            seq_id = last_tokens[seq_i][2]
             token = ll.llama_sampler_sample(samplers[seq_id].sampler, batch_ctx, seq_i)
             ll.llama_sampler_accept(samplers[seq_id].sampler, token)
-            
-            if ll.llama_vocab_is_eog(vocab, token): finished[seq_id] = True
-            else: generated[seq_id].append(token)
-            
+
+            if ll.llama_vocab_is_eog(vocab, token):
+                finished[seq_id] = True
+            else:
+                generated[seq_id].append(token)
+
         ll.llama_batch_free(batch)
 
-    def _parallel_phase2_autoregressive(self, ll, batch_ctx, samplers, vocab, max_tokens, seq_pos, generated, finished):
+    def _parallel_phase2_autoregressive(
+        self, ll, batch_ctx, samplers, vocab, max_tokens, seq_pos, generated, finished
+    ):
         n_seq = len(generated)
         for step in range(1, max_tokens):
-            active = [s for s in range(n_seq) if not finished[s] and len(generated[s]) < max_tokens]
-            if not active: break
+            active = [
+                s
+                for s in range(n_seq)
+                if not finished[s] and len(generated[s]) < max_tokens
+            ]
+            if not active:
+                break
 
             batch = ll.llama_batch_init(len(active), 0, 1)
             batch.n_tokens = len(active)
             for j, seq_id in enumerate(active):
-                batch.token[j], batch.pos[j], batch.n_seq_id[j] = generated[seq_id][-1], seq_pos[seq_id], 1
+                batch.token[j], batch.pos[j], batch.n_seq_id[j] = (
+                    generated[seq_id][-1],
+                    seq_pos[seq_id],
+                    1,
+                )
                 batch.seq_id[j][0], batch.logits[j] = seq_id, True
                 seq_pos[seq_id] += 1
 
@@ -626,9 +826,11 @@ class Engine:
             for j, seq_id in enumerate(active):
                 token = ll.llama_sampler_sample(samplers[seq_id].sampler, batch_ctx, j)
                 ll.llama_sampler_accept(samplers[seq_id].sampler, token)
-                
-                if ll.llama_vocab_is_eog(vocab, token): finished[seq_id] = True
-                else: generated[seq_id].append(token)
+
+                if ll.llama_vocab_is_eog(vocab, token):
+                    finished[seq_id] = True
+                else:
+                    generated[seq_id].append(token)
 
             ll.llama_batch_free(batch)
 
@@ -643,9 +845,12 @@ class Engine:
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        think: bool = False,
     ) -> None:
-        
-        temperature = temperature if temperature is not None else self._config.temperature
+
+        temperature = (
+            temperature if temperature is not None else self._config.temperature
+        )
         top_p = top_p if top_p is not None else self._config.top_p
         top_k = top_k if top_k is not None else self._config.top_k
 
@@ -653,8 +858,17 @@ class Engine:
             saved = self._config.max_output_tokens
             max_tokens = min(4096, self._n_ctx // 2) if saved == "auto" else int(saved)
 
+        think_enabled = think and self._detect_think_capable()
+        if think_enabled:
+            console.print(
+                f"\n[bold blue][chat][/] Model: [bold]{self._alias}[/]  (type 'exit' to quit) [dim cyan](thinking enabled)[/]\n"
+            )
+        else:
+            console.print(
+                f"\n[bold blue][chat][/] Model: [bold]{self._alias}[/]  (type 'exit' to quit)\n"
+            )
+
         messages = [{"role": "system", "content": system_prompt}]
-        console.print(f"\n[bold blue][chat][/] Model: [bold]{self._alias}[/]  (type 'exit' to quit)\n")
 
         while True:
             try:
@@ -674,25 +888,73 @@ class Engine:
             console.print("[bold blue]Assistant:[/] ", end="")
             t0 = time.perf_counter()
 
-            try:
-                for chunk in self._llm.create_chat_completion(
-                    messages=messages, max_tokens=max_tokens, temperature=temperature,
-                    top_p=top_p, top_k=top_k, stream=True,
-                ):
-                    delta = chunk["choices"][0].get("delta", {})
-                    if "content" in delta:
-                        tok = delta["content"]
-                        # We use standard print here to avoid text like [this] crashing rich
-                        print(tok, end="", flush=True)
+            if think_enabled:
+                prompt_text = self.apply_chat_template(
+                    messages, add_generation_prompt=True, enable_thinking=True
+                )
+                thinking_started = False
+                try:
+                    for chunk in self._llm(
+                        prompt=prompt_text,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        stream=True,
+                    ):
+                        tok = chunk["choices"][0]["text"]
+                        if "<think>" in tok:
+                            thinking_started = True
+                            parts = tok.split("<think>", 1)
+                            if parts[0]:
+                                print(parts[0], end="", flush=True)
+                            console.print(f"[bold magenta]<think>[/]")
+                            if parts[1]:
+                                console.print(
+                                    f"[dim cyan]{parts[1]}[/]", end="", flush=True
+                                )
+                            continue
+                        elif "</think>" in tok:
+                            parts = tok.split("</think>", 1)
+                            if parts[0]:
+                                console.print(f"[dim cyan]{parts[0]}[/]")
+                            console.print(f"[bold magenta]</think>[/]")
+                            if parts[1]:
+                                print(parts[1], end="", flush=True)
+                            continue
+                        elif not thinking_started:
+                            thinking_started = True
+                            console.print(f"[bold magenta]<think>[/]")
+                            console.print(f"[dim cyan]{tok}[/]", end="", flush=True)
+                            continue
+                        console.print(f"[dim cyan]{tok}[/]", end="", flush=True)
                         tokens_out.append(tok)
-            except Exception as e:
-                console.print(f"\n[bold red][error][/] Chat failed: {e}")
-                break
+                except Exception as e:
+                    console.print(f"\n[bold red][error][/] Chat failed: {e}")
+                    break
+            else:
+                try:
+                    for chunk in self._llm.create_chat_completion(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        stream=True,
+                    ):
+                        delta = chunk["choices"][0].get("delta", {})
+                        if "content" in delta:
+                            tok = delta["content"]
+                            print(tok, end="", flush=True)
+                            tokens_out.append(tok)
+                except Exception as e:
+                    console.print(f"\n[bold red][error][/] Chat failed: {e}")
+                    break
 
             elapsed = time.perf_counter() - t0
             response = "".join(tokens_out)
             messages.append({"role": "assistant", "content": response})
-            
+
             n_tok = len(tokens_out)
             tps = n_tok / elapsed if elapsed > 0 else 0
             console.print(f"\n\n[dim][{n_tok} tokens | {tps:.1f} tok/s][/]\n")

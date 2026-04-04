@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-engine = "cli:main"
+ma = "cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["engine.py", "cli.py"]

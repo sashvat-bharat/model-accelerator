@@ -22,13 +22,13 @@ CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=on" uv pip install llama-cpp-
 
 # 2. Load & Register a Model
 # Pulls directly from HF, auto-selecting the best quantization (Q4_K_M/Q5_K_M).
-python cli.py load unsloth/Qwen3.5-9B-GGUF --alias qwen3_5-9b
+ma load unsloth/Qwen3.5-9B-GGUF --alias qwen3_5-9b
 
 # 3. Configure (Optional: Set your hardware's "sweet spot")
-python cli.py config qwen3_5-9b --n-ctx 8192 --max-output auto --temp 0.7
+ma config qwen3_5-9b --n-ctx 8192 --max-output auto --temp 0.7
 
 # 4. Interact!
-python cli.py chat qwen3_5-9b --gpu-layers max
+ma chat qwen3_5-9b --gpu-layers max
 ```
 
 ---
@@ -72,6 +72,7 @@ You can add these flags to any command or save them permanently via `config`.
 ### 🎲 Sampling & Logic
 *   `--chat`: Always use this for Instruct/Chat models! It applies the model's specific "brain" format to your prompt.
 *   `--temp <F>`: Controls randomness (0.0 = deterministic, 0.7 = standard, 1.2 = creative).
+*   `--think`: Enables thinking mode for models that support it. The model will output its reasoning in `<think>` tags before the final answer. Silently ignored for models without thinking capability.
 
 ---
 
@@ -91,8 +92,8 @@ model-accelerator/
 
 ## 💎 Pro Tips
 
-- **Stop Typing Flags:** Use `python cli.py config <alias> --gpu-layers max --n-ctx 4096`. These settings are saved to `params.json` and inherited automatically by `run`, `chat`, and `batch`.
+- **Stop Typing Flags:** Use `ma config <alias> --gpu-layers max --n-ctx 4096`. These settings are saved to `params.json` and inherited automatically by `run`, `chat`, and `batch`.
 - **Environment Variables:** You can set `export GGUF_MODELS_DIR=/path/to/large/drive` to keep your models on secondary storage.
-- **Bulk Processing:** Need to categorize 1,000 strings? `python cli.py batch my-model --file prompts.txt --parallel 20` will process them in parallel chunks.
+- **Bulk Processing:** Need to categorize 1,000 strings? `ma batch my-model --file prompts.txt --parallel 20` will process them in parallel chunks.
 
 ---
