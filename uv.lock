@@ -293,6 +293,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "jinja2" },
     { name = "llama-cpp-python" },
     { name = "numpy" },
     { name = "rich" },
@@ -302,6 +303,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.20.0" },
+    { name = "jinja2", specifier = ">=3.1.0" },
     { name = "llama-cpp-python", specifier = ">=0.3.19" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "rich", specifier = ">=13.7.0" },

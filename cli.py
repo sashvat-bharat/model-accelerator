@@ -38,24 +38,26 @@ def _format_thinking_output(console_obj, text: str) -> str:
     we detect the thinking block (content before </think>) and wrap it.
     Tags are bold magenta, thinking content is dim cyan.
     """
-    import re
-
     TAG_OPEN = "<think>"
     TAG_CLOSE = "</think>"
 
     if TAG_OPEN in text and TAG_CLOSE in text:
-        parts = re.split(r"(<think>.*?</think>)", text, flags=re.DOTALL)
         result = []
-        for part in parts:
-            if part.startswith(TAG_OPEN) and TAG_CLOSE in part:
-                inner = part[len(TAG_OPEN) : part.index(TAG_CLOSE)]
-                after = part[part.index(TAG_CLOSE) + len(TAG_CLOSE) :]
+        remaining = text
+        while TAG_OPEN in remaining:
+            idx = remaining.index(TAG_OPEN)
+            result.append(remaining[:idx])
+            remaining = remaining[idx + len(TAG_OPEN) :]
+            if TAG_CLOSE in remaining:
+                end_idx = remaining.index(TAG_CLOSE)
+                inner = remaining[:end_idx]
+                remaining = remaining[end_idx + len(TAG_CLOSE) :]
                 result.append(f"[bold magenta]{TAG_OPEN}[/]\n")
                 result.append(f"[dim cyan]{inner.strip()}[/]\n")
                 result.append(f"[bold magenta]{TAG_CLOSE}[/]\n")
-                result.append(after)
             else:
-                result.append(part)
+                result.append(f"[bold magenta]{TAG_OPEN}[/]")
+        result.append(remaining)
         return "".join(result)
 
     if TAG_CLOSE in text and TAG_OPEN not in text:
@@ -82,18 +84,7 @@ def cmd_load(args: argparse.Namespace) -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     dest_dir = MODELS_DIR / alias
 
-    if source.startswith("hf://") or ("/" in source and not source.startswith("http")):
-        repo_id = source.removeprefix("hf://")
-        _download_hf(repo_id, dest_dir, filename)
-        register_model(alias, str(dest_dir), source)
-
-    elif source.startswith("http://") or source.startswith("https://"):
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_file = dest_dir / f"{alias}.gguf"
-        _download_url(source, dest_file)
-        register_model(alias, str(dest_dir), source)
-
-    elif Path(source).exists():
+    if Path(source).exists():
         import shutil
 
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -103,6 +94,19 @@ def cmd_load(args: argparse.Namespace) -> None:
         else:
             console.print(f"[dim]Copying file → {dest_dir / Path(source).name}[/]")
             shutil.copy2(source, dest_dir / Path(source).name)
+        register_model(alias, str(dest_dir), source)
+
+    elif source.startswith("hf://") or (
+        "/" in source and not source.startswith("http")
+    ):
+        repo_id = source.removeprefix("hf://")
+        _download_hf(repo_id, dest_dir, filename)
+        register_model(alias, str(dest_dir), source)
+
+    elif source.startswith("http://") or source.startswith("https://"):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = dest_dir / f"{alias}.gguf"
+        _download_url(source, dest_file)
         register_model(alias, str(dest_dir), source)
 
     else:
@@ -123,7 +127,15 @@ def _download_hf(repo_id: str, dest_dir: Path, filename: str | None) -> Path:
         )
         sys.exit(1)
 
-    all_files = list(list_repo_files(repo_id))
+    try:
+        all_files = list(list_repo_files(repo_id))
+    except Exception as e:
+        console.print(
+            f"[bold red][error][/] Failed to list files in '{repo_id}'. "
+            f"If this is a private repo, ensure you are logged in (hf auth login). Error: {e}"
+        )
+        sys.exit(1)
+
     gguf_files = [f for f in all_files if f.endswith(".gguf")]
     if not gguf_files:
         console.print(f"[bold red][error][/] No .gguf files found in {repo_id}")
@@ -154,6 +166,7 @@ def _download_hf(repo_id: str, dest_dir: Path, filename: str | None) -> Path:
 
 def _download_url(url: str, dest: Path) -> None:
     import urllib.request
+    from urllib.error import URLError
 
     console.print(f"[dim]Downloading {url} …[/]")
 
@@ -162,8 +175,12 @@ def _download_url(url: str, dest: Path) -> None:
             pct = min(block_num * block_size / total_size * 100, 100)
             print(f"\r  {pct:.1f}%", end="", flush=True)
 
-    urllib.request.urlretrieve(url, dest, reporthook=_progress)
-    console.print(f"\n[bold green]Saved → {dest}[/]")
+    try:
+        urllib.request.urlretrieve(url, dest, reporthook=_progress)
+        console.print(f"\n[bold green]Saved → {dest}[/]")
+    except URLError as e:
+        console.print(f"\n[bold red][error][/] Download failed: {e}")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -187,10 +204,20 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     prompt = args.prompt
     stream = not args.no_stream
-    disp_max = args.max_tokens or config_data.max_output_tokens
     disp_temp = args.temp if args.temp is not None else config_data.temperature
     disp_top_p = args.top_p if args.top_p is not None else config_data.top_p
     disp_top_k = args.top_k if args.top_k is not None else config_data.top_k
+
+    if args.max_tokens is not None:
+        disp_max = str(args.max_tokens)
+    else:
+        saved = config_data.max_output_tokens
+        if saved == "auto":
+            input_toks = engine._llm.tokenize(prompt.encode("utf-8"))
+            computed = max(128, engine._n_ctx - len(input_toks) - 10)
+            disp_max = f"{computed} (auto)"
+        else:
+            disp_max = str(saved)
 
     console.rule("[bold cyan]GENERATION[/]")
     console.print(
@@ -229,27 +256,36 @@ def cmd_run(args: argparse.Namespace) -> None:
                     parts = tok.split(THINK_OPEN, 1)
                     if parts[0]:
                         print(parts[0], end="", flush=True)
+                        tokens += 1
                     print(f"\033[1;35m{THINK_OPEN}\033[0m")
+                    tokens += 1
                     if parts[1]:
                         print(f"\033[2;36m{parts[1]}\033[0m", end="", flush=True)
+                        tokens += 1
                     continue
                 elif THINK_CLOSE in tok:
                     thinking_active = False
                     parts = tok.split(THINK_CLOSE, 1)
                     if parts[0]:
                         print(f"\033[2;36m{parts[0]}\033[0m")
+                        tokens += 1
                     print(f"\033[1;35m{THINK_CLOSE}\033[0m")
+                    tokens += 1
                     if parts[1]:
                         print(parts[1], end="", flush=True)
+                        tokens += 1
                     continue
                 elif not thinking_started_shown:
                     thinking_active = True
                     thinking_started_shown = True
                     print(f"\033[1;35m{THINK_OPEN}\033[0m")
+                    tokens += 1
                     print(f"\033[2;36m{tok}\033[0m", end="", flush=True)
+                    tokens += 1
                     continue
                 elif thinking_active:
                     print(f"\033[2;36m{tok}\033[0m", end="", flush=True)
+                    tokens += 1
                     continue
             print(tok, end="", flush=True)
             tokens += 1
@@ -387,7 +423,11 @@ def cmd_list(_args: argparse.Namespace) -> None:
         size = "MISSING"
         if p.exists():
             if p.is_dir():
-                size = f"{sum(f.stat().st_size for f in p.rglob('*') if f.is_file()) / 1e9:.2f}G"
+                total = 0
+                for f in p.rglob("*.gguf"):
+                    if f.is_file():
+                        total += f.stat().st_size
+                size = f"{total / 1e9:.2f}G"
             else:
                 size = f"{p.stat().st_size / 1e9:.2f}G"
         table.add_row(alias, size, meta["source"])
@@ -471,32 +511,36 @@ def cmd_config(args: argparse.Namespace) -> None:
 
 
 def cmd_bench(args: argparse.Namespace) -> None:
-    from engine import Engine
+    from engine import Engine, get_model_config
+
+    config_data = get_model_config(args.alias)
+    n_ctx = args.n_ctx or config_data.configured_context_length
 
     engine = Engine(
         alias=args.alias,
         n_gpu_layers=args.gpu_layers,
-        n_ctx=args.n_ctx,
+        n_ctx=n_ctx,
         n_batch=args.n_batch,
         n_threads=args.n_threads,
     )
 
+    bench_max_tokens = args.max_tokens or 256
+
     console.rule("[bold cyan]BENCHMARK[/]")
     console.print(f"Runs: {args.runs} | Prompt: '{args.prompt[:40]}...'\n")
 
-    tok_secs = []
-    for i in range(1, args.runs + 1):
-        t0 = time.perf_counter()
-        raw = engine._llm(
-            prompt=args.prompt, max_tokens=args.max_tokens, temperature=0.0, echo=False
-        )
-        elapsed = time.perf_counter() - t0
+    results = engine.benchmark(
+        prompt=args.prompt,
+        max_tokens=bench_max_tokens,
+        runs=args.runs,
+    )
 
-        n = raw.get("usage", {}).get("completion_tokens", args.max_tokens)
-        ts = n / elapsed if elapsed else 0
+    tok_secs = []
+    for r in results:
+        ts = r["tok_per_sec"]
         tok_secs.append(ts)
         console.print(
-            f"  Run {i:>2}: {n} tokens  [bold green]{ts:.1f} tok/s[/]  ({elapsed:.2f}s)"
+            f"  Run {r['run']:>2}: {r['tokens']} tokens  [bold green]{ts:.1f} tok/s[/]  ({r['elapsed']:.2f}s)"
         )
 
     avg = sum(tok_secs) / len(tok_secs)
@@ -592,9 +636,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_perf_args(p_chat)
     p_chat.set_defaults(func=cmd_chat)
 
-    p_list = sub.add_parser("list", help="Show all registered models").set_defaults(
-        func=cmd_list
-    )
+    p_list = sub.add_parser("list", help="Show all registered models")
+    p_list.set_defaults(func=cmd_list)
 
     p_config = sub.add_parser("config", help="View or modify model configuration")
     p_config.add_argument("alias", help="Model alias")

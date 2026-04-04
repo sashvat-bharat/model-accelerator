@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import gc
+import threading
 import multiprocessing
 from pathlib import Path
 from typing import Iterator
@@ -26,18 +27,60 @@ from rich.console import Console
 console = Console()
 
 
+# ---------------------------------------------------------------------------
+# Custom exception to replace sys.exit() in library functions
+# ---------------------------------------------------------------------------
+
+
+class ModelNotFoundError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Suppress C stderr (thread-safe, leak-free)
+# ---------------------------------------------------------------------------
+
+_stderr_lock = threading.Lock()
+
+
 @contextmanager
 def suppress_c_stderr():
-    fd = sys.stderr.fileno()
-    original_stderr = os.dup(fd)
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, fd)
-    try:
-        yield
-    finally:
-        os.dup2(original_stderr, fd)
-        os.close(original_stderr)
-        os.close(devnull)
+    with _stderr_lock:
+        fd = sys.stderr.fileno()
+        original_stderr = os.dup(fd)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, fd)
+        try:
+            yield
+        finally:
+            os.dup2(original_stderr, fd)
+            os.close(original_stderr)
+            os.close(devnull)
+
+
+# ---------------------------------------------------------------------------
+# One-time global __del__ patch (fix #16)
+# ---------------------------------------------------------------------------
+
+
+def _apply_safe_del_patch():
+    import llama_cpp._internals
+
+    if hasattr(llama_cpp._internals.LlamaModel.__del__, "_safe_patched"):
+        return
+    original_del = llama_cpp._internals.LlamaModel.__del__
+
+    def safe_del(obj):
+        try:
+            original_del(obj)
+        except Exception:
+            pass
+
+    safe_del._safe_patched = True
+    llama_cpp._internals.LlamaModel.__del__ = safe_del
+
+
+_apply_safe_del_patch()
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +134,6 @@ if _ENV_DIR:
     MODELS_DIR = Path(_ENV_DIR)
     REGISTRY_FILE = MODELS_DIR / "models.json"
 else:
-    # Strictly preserve backward compatibility with existing root models.json
     MODELS_DIR = Path("./models")
     REGISTRY_FILE = Path("./models.json")
 
@@ -118,23 +160,18 @@ def register_model(alias: str, path: str, source: str) -> None:
 def resolve_model(alias: str) -> str:
     reg = _load_registry()
     if alias not in reg:
-        console.print(
-            f"[bold red][error][/] Unknown alias '{alias}'. Run: python cli.py load <url> --alias {alias}"
+        raise ModelNotFoundError(
+            f"Unknown alias '{alias}'. Run: python cli.py load <url> --alias {alias}"
         )
-        sys.exit(1)
 
     path = Path(reg[alias]["path"])
     if not path.exists():
-        console.print(f"[bold red][error][/] Model path missing: {path}")
-        sys.exit(1)
+        raise ModelNotFoundError(f"Model path missing: {path}")
 
     if path.is_dir():
         ggufs = list(path.glob("*.gguf"))
         if not ggufs:
-            console.print(
-                f"[bold red][error][/] No .gguf file found in directory: {path}"
-            )
-            sys.exit(1)
+            raise ModelNotFoundError(f"No .gguf file found in directory: {path}")
         return str(ggufs[0])
 
     return str(path)
@@ -159,7 +196,7 @@ def get_model_capabilities(alias: str) -> ModelCapabilities:
         exists=p.exists(),
         size=f"{p.stat().st_size / 1e9:.2f} GB" if p.exists() else "0 GB",
         total_context_length=_DEFAULT_N_CTX,
-        total_layers=32,  # Fallback assumption
+        total_layers=32,
     )
 
     if p.exists():
@@ -168,26 +205,28 @@ def get_model_capabilities(alias: str) -> ModelCapabilities:
             with suppress_c_stderr():
                 temp_llm = Llama(model_path=actual_file, vocab_only=True, verbose=False)
 
-                for k, v in temp_llm.metadata.items():
-                    # Parse Context Length
-                    if k.endswith(".context_length") and not k.endswith(
-                        ".original_context_length"
-                    ):
-                        try:
-                            caps.total_context_length = int(v)
-                        except (ValueError, TypeError):
-                            pass
+            for k, v in temp_llm.metadata.items():
+                if k.endswith(".context_length") and not k.endswith(
+                    ".original_context_length"
+                ):
+                    try:
+                        caps.total_context_length = int(v)
+                    except (ValueError, TypeError):
+                        pass
 
-                    # Parse EXACT Layer Count (block_count)
-                    if k.endswith(".block_count"):
-                        try:
-                            caps.total_layers = int(v)
-                        except (ValueError, TypeError):
-                            pass
+                if k.endswith(".block_count"):
+                    try:
+                        caps.total_layers = int(v)
+                    except (ValueError, TypeError):
+                        pass
 
-                del temp_llm
-        except Exception:
-            pass
+            del temp_llm
+        except ModelNotFoundError:
+            raise
+        except Exception as e:
+            console.print(
+                f"[dim yellow][warn] Could not read GGUF metadata for '{alias}': {e}[/]"
+            )
 
     return caps
 
@@ -245,18 +284,15 @@ class Engine:
         config = get_model_config(alias)
         caps = get_model_capabilities(alias)
 
-        # Resolve Context
         if n_ctx is None:
             n_ctx = config.configured_context_length or _DEFAULT_N_CTX
         n_ctx = min(n_ctx, caps.total_context_length)
 
-        # Resolve Batch & Threads
         if n_batch is None:
             n_batch = _DEFAULT_N_BATCH
         if n_threads is None:
             n_threads = _DEFAULT_N_THREADS
 
-        # Resolve exact target layers (+1 for output projection head)
         exact_model_layers = caps.total_layers + 1
 
         if n_gpu_layers == "max" or n_gpu_layers is None:
@@ -282,21 +318,10 @@ class Engine:
             f"         gpu_layers : [green]{gpu_layers}[/] {'(Auto-Max)' if is_auto else '(Forced)'}"
         )
 
-        # Safety patch for some environments
-        import llama_cpp._internals
-
-        original_del = llama_cpp._internals.LlamaModel.__del__
-
-        def safe_del(obj):
-            try:
-                original_del(obj)
-            except Exception:
-                pass
-
-        llama_cpp._internals.LlamaModel.__del__ = safe_del
+        has_gpu = gpu_layers > 0
 
         self._llm = None
-        max_attempts = gpu_layers + 1
+        max_attempts = min(gpu_layers + 1, 20)
         attempts = 0
         hit_oom = False
 
@@ -312,16 +337,11 @@ class Engine:
                         n_gpu_layers=gpu_layers,
                         verbose=False,
                         use_mmap=True,
-                        flash_attn=True,
+                        flash_attn=has_gpu,
                     )
 
-                # --- Dynamic Compute Margin ---
-                # If we had to step down due to OOM, `gpu_layers` puts VRAM exactly at 100%.
-                # We need to leave a math buffer for generating text, else it hard-crashes.
                 if hit_oom and gpu_layers > 0:
-                    margin = max(
-                        2, int(exact_model_layers * 0.06)
-                    )  # ~6% of layers buffer
+                    margin = max(2, int(exact_model_layers * 0.06))
                     safe_layers = max(0, gpu_layers - margin)
 
                     console.print(
@@ -331,16 +351,14 @@ class Engine:
                         f"[dim yellow]  → Applying {margin}-layer compute margin. Reloading at {safe_layers}...[/]"
                     )
 
-                    # Hard destroy the overloaded instance to clear GPU memory immediately
                     del self._llm
                     self._llm = None
                     gc.collect()
                     time.sleep(0.3)
 
-                    # Refresh for the safe pass
                     gpu_layers = safe_layers
-                    hit_oom = False  # Act as a fresh load without OOM tracking
-                    continue  # Re-enter the while loop with the safe layer count
+                    hit_oom = False
+                    continue
 
             except (ValueError, RuntimeError) as e:
                 attempts += 1
@@ -437,7 +455,7 @@ class Engine:
         template = self._llm.metadata.get("tokenizer.chat_template", "")
         if not template:
             return False
-        think_markers = ["<think>", "<think>", "thinking_prefix", "thinking_suffix"]
+        think_markers = ["<think>", "thinking_prefix", "thinking_suffix"]
         return any(marker in template for marker in think_markers)
 
     def generate(
@@ -463,6 +481,7 @@ class Engine:
             if saved == "auto":
                 input_toks = self._llm.tokenize(prompt.encode("utf-8"))
                 max_tokens = max(128, self._n_ctx - len(input_toks) - 10)
+                max_tokens = min(max_tokens, self._n_ctx - len(input_toks) - 10)
             else:
                 max_tokens = int(saved)
 
@@ -482,8 +501,9 @@ class Engine:
                         stream=True,
                     ):
                         delta = chunk["choices"][0].get("delta", {})
-                        if "content" in delta:
-                            yield delta["content"]
+                        content = delta.get("content")
+                        if content:
+                            yield content
 
                 return _gen()
 
@@ -494,7 +514,7 @@ class Engine:
                 top_p=top_p,
                 top_k=top_k,
             )
-            return result["choices"][0]["message"]["content"]
+            return result["choices"][0]["message"].get("content", "")
 
         if use_thinking:
             prompt_text = self.apply_chat_template(
@@ -626,6 +646,11 @@ class Engine:
             if seq_budget > n_ctx:
                 if current_batch:
                     sub_batches.append(current_batch)
+                if len(toks) > n_ctx:
+                    raise RuntimeError(
+                        f"Prompt {idx} requires {len(toks)} tokens but context window is {n_ctx}. "
+                        f"Reduce --n-ctx or split the prompt."
+                    )
                 sub_batches.append([idx])
                 current_batch, current_ctx_usage = [], 0
                 continue
@@ -656,59 +681,57 @@ class Engine:
         n_seq = len(prompts)
         vocab = llm._model.vocab
 
-        # 1. Init
         batch_ctx, samplers = self._init_parallel_context(
             ll, prompt_tokens, max_tokens, temperature, top_p, top_k
         )
 
-        # 2. State setup
         generated: list[list[int]] = [[] for _ in range(n_seq)]
         seq_pos: list[int] = [0] * n_seq
         finished: list[bool] = [False] * n_seq
 
         t0 = time.perf_counter()
 
-        # 3. Execution Phases
-        last_tokens = self._parallel_phase1_prefill(
-            ll, batch_ctx, prompt_tokens, seq_pos
-        )
-        self._parallel_phase1_5_first_decode(
-            ll, batch_ctx, samplers, vocab, last_tokens, generated, finished
-        )
-        self._parallel_phase2_autoregressive(
-            ll, batch_ctx, samplers, vocab, max_tokens, seq_pos, generated, finished
-        )
+        try:
+            last_tokens = self._parallel_phase1_prefill(
+                ll, batch_ctx, prompt_tokens, seq_pos
+            )
+            self._parallel_phase1_5_first_decode(
+                ll, batch_ctx, samplers, vocab, last_tokens, generated, finished
+            )
+            self._parallel_phase2_autoregressive(
+                ll, batch_ctx, samplers, vocab, max_tokens, seq_pos, generated, finished
+            )
+        finally:
+            for s in samplers:
+                s.close()
+            ll.llama_free(batch_ctx)
 
         elapsed = time.perf_counter() - t0
 
-        # 4. Cleanup & Formatting
         results = []
-        total_gen = sum(len(g) for g in generated)
-        tok_per_sec = total_gen / elapsed if elapsed > 0 else 0.0
-
         for seq_id in range(n_seq):
             text = llm.detokenize(generated[seq_id]).decode("utf-8", errors="replace")
             n_tok = len(generated[seq_id])
+            seq_tok_per_sec = n_tok / elapsed if elapsed > 0 else 0.0
             results.append(
                 {
                     "prompt": prompts[seq_id],
                     "output": text,
                     "tokens": n_tok,
                     "elapsed": round(elapsed, 3),
-                    "tok_per_sec": round(tok_per_sec, 1),
+                    "tok_per_sec": round(seq_tok_per_sec, 1),
                 }
             )
             console.print(
                 f"  [dim][{start_idx + seq_id + 1}/{total}][/] {n_tok} tokens  (parallel batch)"
             )
 
+        total_gen = sum(len(g) for g in generated)
+        tok_per_sec = total_gen / elapsed if elapsed > 0 else 0.0
         console.print(
             f"  → decoded {n_seq} prompts in {elapsed:.2f}s — {total_gen} tokens total — [bold]{tok_per_sec:.1f} tok/s[/] effective"
         )
 
-        for s in samplers:
-            s.close()
-        ll.llama_free(batch_ctx)
         return results
 
     def _init_parallel_context(
@@ -717,6 +740,12 @@ class Engine:
         llm = self._llm
         n_seq = len(prompt_tokens)
         required_ctx = sum(len(t) + max_tokens for t in prompt_tokens)
+
+        if required_ctx > 128 * 1024:
+            raise RuntimeError(
+                f"Batch requires {required_ctx} context tokens, exceeding safe limit of 131072. "
+                f"Reduce --parallel or --max-tokens."
+            )
 
         ctx_params = ll.llama_context_default_params()
         ctx_params.n_ctx = max(required_ctx, llm.context_params.n_ctx)
@@ -753,6 +782,10 @@ class Engine:
         n_batch = self._llm.n_batch
 
         for seq_id, toks in enumerate(prompt_tokens):
+            if len(toks) == 0:
+                last_tokens.append((self._llm.token_bos(), 0, seq_id))
+                seq_pos[seq_id] = 1
+                continue
             for i, tok in enumerate(toks[:-1]):
                 non_last_prefill.append((tok, i, seq_id))
             last_tokens.append((toks[-1], len(toks) - 1, seq_id))
@@ -838,6 +871,30 @@ class Engine:
     # Interactive chat (REPL)
     # ------------------------------------------------------------------
 
+    def _count_message_tokens(self, messages: list[dict]) -> int:
+        total = 0
+        for m in messages:
+            content = m.get("content", "")
+            total += len(self._llm.tokenize(content.encode("utf-8")))
+        return total
+
+    def _truncate_chat_history(self, messages: list[dict]) -> list[dict]:
+        if len(messages) <= 1:
+            return messages
+
+        system_msg = messages[0] if messages[0]["role"] == "system" else None
+        conversation = messages[1:] if system_msg else messages[:]
+
+        while len(conversation) > 2:
+            tokens = self._count_message_tokens(conversation)
+            if tokens < self._n_ctx * 0.8:
+                break
+            conversation = conversation[2:]
+
+        if system_msg:
+            return [system_msg] + conversation
+        return conversation
+
     def chat(
         self,
         system_prompt: str = "You are a helpful assistant.",
@@ -884,6 +941,7 @@ class Engine:
                 continue
 
             messages.append({"role": "user", "content": user_input})
+            messages = self._truncate_chat_history(messages)
             tokens_out = []
             console.print("[bold blue]Assistant:[/] ", end="")
             t0 = time.perf_counter()
@@ -913,19 +971,23 @@ class Engine:
                                 console.print(
                                     f"[dim cyan]{parts[1]}[/]", end="", flush=True
                                 )
+                                tokens_out.append(parts[1])
                             continue
                         elif "</think>" in tok:
                             parts = tok.split("</think>", 1)
                             if parts[0]:
                                 console.print(f"[dim cyan]{parts[0]}[/]")
+                                tokens_out.append(parts[0])
                             console.print(f"[bold magenta]</think>[/]")
                             if parts[1]:
                                 print(parts[1], end="", flush=True)
+                                tokens_out.append(parts[1])
                             continue
                         elif not thinking_started:
                             thinking_started = True
                             console.print(f"[bold magenta]<think>[/]")
                             console.print(f"[dim cyan]{tok}[/]", end="", flush=True)
+                            tokens_out.append(tok)
                             continue
                         console.print(f"[dim cyan]{tok}[/]", end="", flush=True)
                         tokens_out.append(tok)
@@ -943,10 +1005,10 @@ class Engine:
                         stream=True,
                     ):
                         delta = chunk["choices"][0].get("delta", {})
-                        if "content" in delta:
-                            tok = delta["content"]
-                            print(tok, end="", flush=True)
-                            tokens_out.append(tok)
+                        content = delta.get("content")
+                        if content:
+                            print(content, end="", flush=True)
+                            tokens_out.append(content)
                 except Exception as e:
                     console.print(f"\n[bold red][error][/] Chat failed: {e}")
                     break
@@ -958,3 +1020,28 @@ class Engine:
             n_tok = len(tokens_out)
             tps = n_tok / elapsed if elapsed > 0 else 0
             console.print(f"\n\n[dim][{n_tok} tokens | {tps:.1f} tok/s][/]\n")
+
+    def benchmark(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        runs: int = 3,
+    ) -> list[dict]:
+        results = []
+        for i in range(runs):
+            t0 = time.perf_counter()
+            raw = self._llm(
+                prompt=prompt, max_tokens=max_tokens, temperature=0.0, echo=False
+            )
+            elapsed = time.perf_counter() - t0
+            n = raw.get("usage", {}).get("completion_tokens", max_tokens)
+            ts = n / elapsed if elapsed > 0 else 0
+            results.append(
+                {
+                    "run": i + 1,
+                    "tokens": n,
+                    "tok_per_sec": round(ts, 1),
+                    "elapsed": round(elapsed, 2),
+                }
+            )
+        return results
